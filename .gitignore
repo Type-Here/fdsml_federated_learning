@@ -156,3 +156,5 @@ cython_debug/
 simulated_FL.py
 /federated_model_weights/
 /yolo_benchmark/yolo_training/
+
+internal_docs/
