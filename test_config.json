@@ -1,0 +1,35 @@
+{
+  "ip_address": "127.0.0.1",
+  "port": 5001,
+  "base_csv_path": "csv",
+  "base_log_path": "logs",
+  "base_plot_path": "static/plots",
+  "base_split_data_path": "run_dataset",
+  "early_stop_patience": 5,
+  "weighted_aggregation": true,
+  "datasets": [
+    {
+      "name": "dataset_slices_sorted",
+      "path": "dataset/dataset_slices_sorted",
+      "num_classes": 2
+    }
+  ],
+  "common_search_space": {
+    "encryption_mode": ["no_encryption"],
+    "device": ["cpu"],
+    "global_epoch": [1],
+    "local_epoch": [1],
+    "num_clients": [2],
+    "models_percentage": [1],
+    "learning_rate": [0.001],
+    "batch_size": [16],
+    "aggregation_algorithm": ["FedAvg"],
+    "fedprox_mu": [0.0]
+  },
+  "model_specific_search_space": {
+    "ResNet18": {
+      "image_size": [128],
+      "num_custom_layers": [2]
+    }
+  }
+}

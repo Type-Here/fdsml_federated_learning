@@ -1,0 +1,215 @@
+{
+  "ip_address": "127.0.0.1",
+  "port": 5001,
+  "base_csv_path": "csv",
+  "base_log_path": "logs",
+  "base_plot_path": "static/plots",
+  "base_split_data_path": "run_dataset",
+  "early_stop_patience": 5,
+  "weighted_aggregation": true,
+  "datasets": [
+    {
+      "name": "dataset_slices_sorted",
+      "path": "dataset/dataset_slices_sorted",
+      "num_classes": 2
+    },
+    {
+      "name": "dataset_slices_sorted_augmented",
+      "path": "dataset/dataset_slices_sorted_augmented",
+      "num_classes": 2
+    },
+    {
+      "name": "dataset_slices_sorted_T2",
+      "path": "dataset/dataset_slices_sorted_T2",
+      "num_classes": 2
+    },
+    {
+      "name": "dataset_slices_sorted_T2_augmented",
+      "path": "dataset/dataset_slices_sorted_T2_augmented",
+      "num_classes": 2
+    },
+    {
+      "name": "dataset_slices_sorted_T1",
+      "path": "dataset/dataset_slices_sorted_T1",
+      "num_classes": 2
+    },
+    {
+      "name": "dataset_slices_sorted_T1_augmented",
+      "path": "dataset/dataset_slices_sorted_T1_augmented",
+      "num_classes": 2
+    },
+    {
+      "name": "dataset_slices_sorted_Flair_augmented",
+      "path": "dataset/dataset_slices_sorted_Flair_augmented",
+      "num_classes": 2
+    },
+    {
+      "name": "dataset_slices_sorted_Flair",
+      "path": "dataset/dataset_slices_sorted_Flair",
+      "num_classes": 2
+    },
+    {
+      "name": "dataset_multy_sorted",
+      "path": "dataset/dataset_multy_sorted",
+      "num_classes": 3
+    },
+    {
+      "name": "dataset_multy_sorted_augmented",
+      "path": "dataset/dataset_multy_sorted_augmented",
+      "num_classes": 3
+    },
+    {
+      "name": "dataset_multy_sorted_T2",
+      "path": "dataset/dataset_multy_sorted_T2",
+      "num_classes": 3
+    },
+    {
+      "name": "dataset_multy_sorted_T2_augmented",
+      "path": "dataset/dataset_multy_sorted_T2_augmented",
+      "num_classes": 3
+    },
+    {
+      "name": "dataset_multy_sorted_T1",
+      "path": "dataset/dataset_multy_sorted_T1",
+      "num_classes": 3
+    },
+    {
+      "name": "dataset_multy_sorted_T1_augmented",
+      "path": "dataset/dataset_multy_sorted_T1_augmented",
+      "num_classes": 3
+    },
+    {
+      "name": "dataset_multy_sorted_Flair_augmented",
+      "path": "dataset/dataset_multy_sorted_Flair_augmented",
+      "num_classes": 3
+    },
+    {
+      "name": "dataset_multy_sorted_Flair",
+      "path": "dataset/dataset_multy_sorted_Flair",
+      "num_classes": 3
+    }
+  ],
+  "common_search_space": {
+    "encryption_mode": [
+      "no_encryption",
+      "direct_encrypted_update"
+    ],
+    "device": [
+      "cuda"
+    ],
+    "global_epoch": [
+      5,
+      10,
+      20,
+      30,
+      40,
+      50
+    ],
+    "local_epoch": [
+      1,
+      2,
+      3,
+      5,
+      10
+    ],
+    "num_clients": [
+      2,
+      4,
+      8,
+      16,
+      32
+    ],
+    "models_percentage": [
+      1
+    ],
+    "learning_rate": [
+      0.01,
+      0.001,
+      0.0001
+    ],
+    "batch_size": [
+      16
+    ],
+    "aggregation_algorithm": [
+      "FedAvg",
+      "FedProx"
+    ],
+    "fedprox_mu": [
+      0.05
+    ]
+  },
+  "model_specific_search_space": {
+    "GoogLeNet": {
+      "image_size": [
+        128,
+        224
+      ],
+      "num_custom_layers": [
+        2,
+        4
+      ]
+    },
+    "AlexNet": {
+      "image_size": [
+        128,
+        224
+      ],
+      "num_custom_layers": [
+        2,
+        4
+      ]
+    },
+    "ConvNet": {
+      "image_size": [
+        128,
+        224
+      ],
+      "convnet_hidden1": [
+        32
+      ],
+      "convnet_hidden2": [
+        16
+      ]
+    },
+    "ResNet18": {
+      "image_size": [
+        128,
+        224
+      ],
+      "num_custom_layers": [
+        2,
+        4
+      ]
+    },
+    "ResNet34": {
+      "image_size": [
+        128,
+        224
+      ],
+      "num_custom_layers": [
+        2,
+        4
+      ]
+    },
+    "ResNet50": {
+      "image_size": [
+        128,
+        224
+      ],
+      "num_custom_layers": [
+        2,
+        4
+      ]
+    },
+    "ResNet101": {
+      "image_size": [
+        128,
+        224
+      ],
+      "num_custom_layers": [
+        2,
+        4
+      ]
+    }
+  }
+}
