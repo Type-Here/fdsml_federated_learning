@@ -11,7 +11,7 @@ from flask_socketio import SocketIO, emit
 
 from utils import object_to_pickle_string, pickle_string_to_object, sum_encrypted_weights, \
     multiply_encrypted_weights_by_scalar
-from aggregator import Aggregator
+from aggregator_ext import ExtendedAggregator
 
 
 def load_json(filename: str) -> Dict:
@@ -48,7 +48,7 @@ class FederatedServer:
         self.client_metrics_buffer: List[Dict] = []  # For 'metrics_first' strategy
         self.total_training_size_in_round: int = 0
 
-        self.aggregator = Aggregator(self.config, self.logger)
+        self.aggregator = ExtendedAggregator(self.config, self.logger)
 
         self.client_stats_buffer: List[Dict] = []
         self.static_calibration_term: np.ndarray = None

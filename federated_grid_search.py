@@ -14,10 +14,14 @@ import multiprocessing
 import queue
 
 from trusted_authority import TrustedAuthority
+from seeding import seed_from_config
 import federated_server
 import run_multiple_clients
 
-NUM_PARALLEL_EXECUTIONS = 12
+# Default number of federated simulations run at the same time. Sized for a
+# multi-GPU machine; override with "num_parallel_executions" in the config file
+# on a single-GPU box or on Colab, where 12 concurrent runs exhaust memory.
+DEFAULT_NUM_PARALLEL_EXECUTIONS = 12
 GRID_SEARCH_CONFIG_PATH = 'grid_search_config.json'
 VERBOSE_DUPLICATE_CHECK = False
 
@@ -127,6 +131,13 @@ def run_grid_search_worker(
             print("\n" + "#" * 80)
             print(f"### [Worker {worker_id}] DEQUEUED NEW CONFIG FOR: {dataset_name} | {config['model_name']} ###")
             config['worker_id'] = worker_id
+            # Seed once per configuration, not once per worker: the result of a
+            # config must not depend on which worker dequeued it or in what
+            # order. Without this, random.sample in the server picks different
+            # clients every time and two runs of the same config diverge.
+            applied_seed = seed_from_config(config)
+            config['seed'] = applied_seed
+            print(f"[Worker {worker_id}] Global seed set to {applied_seed}.")
             config['port'] = base_port + worker_id * 2
             config['ta_port'] = base_port + worker_id * 2 + 1
             config['splitting_dir'] = worker_splitting_dir
@@ -237,7 +248,13 @@ def main():
 
                 if hyper_config.get('aggregation_algorithm') != "FedProx": hyper_config['fedprox_mu'] = 0.0
                 if 'ResNet' in model_name or 'GoogLeNet' in model_name or 'AlexNet' in model_name:
-                    hyper_config['image_size'] = 224
+                    # setdefault, NOT assignment: this block only normalises keys so
+                    # that fingerprints match across runs. A hard assignment here
+                    # overrode whatever image_size the search space asked for,
+                    # collapsing the axis to 224 and making the generated configs
+                    # duplicates that the fingerprint check then discarded.
+                    # Mirrors the CSV side, which already uses setdefault.
+                    hyper_config.setdefault('image_size', 224)
                     hyper_config.setdefault('convnet_hidden1', -1)
                     hyper_config.setdefault('convnet_hidden2', -1)
                 elif 'ConvNet' in model_name:
@@ -268,14 +285,16 @@ def main():
         return
 
     processes = []
-    print(f"\n=== Starting {NUM_PARALLEL_EXECUTIONS} Grid Search workers ===")
+    num_parallel = int(base_grid_config.get('num_parallel_executions',
+                                            DEFAULT_NUM_PARALLEL_EXECUTIONS))
+    print(f"\n=== Starting {num_parallel} Grid Search workers ===")
     base_port = base_grid_config['port']
-    for i in range(NUM_PARALLEL_EXECUTIONS):
+    for i in range(num_parallel):
         process = multiprocessing.Process(target=run_grid_search_worker, args=(i, task_queue, base_port, csv_lock))
         processes.append(process);
         process.start()
     task_queue.join()
-    for _ in range(NUM_PARALLEL_EXECUTIONS): task_queue.put(None)
+    for _ in range(num_parallel): task_queue.put(None)
     for process in processes: process.join()
     print("\n=== All parallel executions have finished. ===")
 
