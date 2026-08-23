@@ -158,3 +158,16 @@ simulated_FL.py
 /yolo_benchmark/yolo_training/
 
 internal_docs/
+
+# Our own working notes / study companion
+docs/
+
+# Datasets: regenerate with datasets_prep/prepare_gtsrb.py, never commit images
+dataset/
+run_dataset*/
+
+# Per-run outputs (directories are suffixed with the hostname by PCNAME.py)
+csv*/
+logs*/
+static/plots*/
+checkpoints/
