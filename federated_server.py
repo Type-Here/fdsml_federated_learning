@@ -50,7 +50,27 @@ class FederatedServer:
 
         self.aggregator = ExtendedAggregator(self.config, self.logger)
 
-        self.client_stats_buffer: List[Dict] = []
+        # --- Per-client identity ------------------------------------
+        # `samples_per_class` used to be appended to a flat list, which threw
+        # away *who* sent it. FedDisco needs, for the same client k, both its
+        # sample count n_k (which arrives with the weight update) and its label
+        # distribution (which arrives at ready time), and the two lists fill in
+        # different orders: readiness in connection order, updates in
+        # whoever-finishes-training-first order, over a random subset of clients.
+        #
+        # Keyed by a STABLE client id, not by the Socket.IO `sid`. The `sid`
+        # identifies the *connection* and changes on reconnect, so keying by it
+        # would still let one client be counted twice.
+        self.client_stats: Dict[str, np.ndarray] = {}   # client_id -> per-class counts
+        self.client_sid: Dict[str, str] = {}            # client_id -> its current sid
+        self.sid_to_client: Dict[str, str] = {}         # sid -> client_id
+
+        # The "have we already started?" guard used to be
+        # `static_calibration_term is None`, but that field is only ever set for
+        # FedLC. Under FedAvg it stays None forever, so a late or repeated
+        # `client_ready` would start round 0 a second time.
+        self.training_started: bool = False
+
         self.static_calibration_term: np.ndarray = None
 
         # --- Encryption ---
@@ -148,6 +168,12 @@ class FederatedServer:
             'round_number': self.current_round,
             'current_weights': current_weights_pickled,
             'total_training_size': self.total_training_size_in_round,
+            # What the client must divide the payload by. FedAvg-style rules
+            # send N (the server summed, the client averages); rules whose
+            # server output is already the finished model send 1.0.
+            'aggregation_denominator': self.aggregator.client_denominator(
+                self.total_training_size_in_round
+            ),
         }
 
         self.logger.info("Requesting updates from clients: %s", selected_clients)
@@ -163,6 +189,9 @@ class FederatedServer:
             'batch_size': self.config['batch_size'],
             'current_weights': object_to_pickle_string(self.aggregator.current_weights),
             'total_training_size': self.total_training_size_in_round,
+            'aggregation_denominator': self.aggregator.client_denominator(
+                self.total_training_size_in_round
+            ),
             'STOP': self.is_training_finished,
             'round_number': self.current_round
         }
@@ -175,6 +204,12 @@ class FederatedServer:
         train_losses = [x['train_loss'] for x in self.client_updates_this_round]
         train_sizes = [x['train_size'] for x in self.client_updates_this_round]
         self.total_training_size_in_round = sum(train_sizes)
+
+        # Hand the label distributions to the aggregator, keyed by client id, so
+        # a discrepancy-aware rule can look up the sender of each update. Done
+        # here rather than once at startup so the mapping is always current.
+        self.aggregator.register_client_stats(self.client_stats)
+
         if self.encryption_mode == 'no_encryption':
             self.logger.info("Aggregating plaintext updates.")
             self.aggregator.aggregate_weights(
@@ -210,9 +245,15 @@ class FederatedServer:
         self.logger.info("Client connected: %s", request.sid)
 
     def _on_disconnect(self):
-        self.logger.info("Client disconnected: %s", request.sid)
-        if request.sid in self.registered_clients:
-            self.registered_clients.remove(request.sid)
+        client_id = self.sid_to_client.pop(request.sid, None)
+        self.logger.info("Client disconnected: %s (%s)", request.sid, client_id or "unknown")
+        self.registered_clients.discard(request.sid)
+        # Forget the connection, keep the statistics. `client_stats`
+        # describes the client's *data*, not its socket, so a reconnect must not
+        # restart the readiness count from scratch - which is what made the old
+        # flat buffer double-count.
+        if client_id is not None and self.client_sid.get(client_id) == request.sid:
+            del self.client_sid[client_id]
         # In a real system, you might need to handle client dropouts during a round.
 
     def _on_reconnect(self):
@@ -226,15 +267,41 @@ class FederatedServer:
 
         # federated_server.py
 
+    @staticmethod
+    def _client_key(data: Dict) -> str:
+        """The stable identifier of the client that sent the current event.
+
+        Clients send `client_id` (the name of their data directory, e.g.
+        `client_0`), which survives a reconnect. `request.sid` is the Socket.IO
+        session id: it identifies the connection and is regenerated whenever the
+        client reconnects. The fallback keeps the server working with a client
+        that does not send an id yet.
+        """
+        return data.get('client_id') or request.sid
+
     def _on_client_ready(self, data: Dict):
-        self.logger.info("Client %s is ready and sent data stats.", request.sid)
+        client_id = self._client_key(data)
+        self.logger.info("Client %s (sid %s) is ready and sent data stats.", client_id, request.sid)
+
+        # A reconnecting client comes back under a new sid. Drop the stale one,
+        # otherwise `_start_next_training_round` can sample a dead sid and the
+        # round waits forever for an update that will never arrive.
+        previous_sid = self.client_sid.get(client_id)
+        if previous_sid is not None and previous_sid != request.sid:
+            self.logger.info("Client %s reconnected: replacing stale sid %s.", client_id, previous_sid)
+            self.registered_clients.discard(previous_sid)
+            self.sid_to_client.pop(previous_sid, None)
+
         self.registered_clients.add(request.sid)
+        self.client_sid[client_id] = request.sid
+        self.sid_to_client[request.sid] = client_id
 
-        samples_per_class = pickle_string_to_object(data['samples_per_class'])
-        self.client_stats_buffer.append(samples_per_class)
+        # Assignment, not append: a client that reports ready twice overwrites
+        # its own entry instead of inflating the count.
+        self.client_stats[client_id] = pickle_string_to_object(data['samples_per_class'])
 
-        if len(self.client_stats_buffer) >= self.config['num_clients'] and self.static_calibration_term is None:
-            # --- FINE DELLA CORREZIONE ---
+        if not self.training_started and len(self.client_stats) >= self.config['num_clients']:
+            self.training_started = True
             self.logger.info("All clients are ready. Finalizing initialization...")
             self._finalize_initialization_and_start_training()
 
@@ -245,7 +312,7 @@ class FederatedServer:
             self.logger.info("Calculating static calibration term...")
 
             # 1. Aggrega i conteggi da tutti i client
-            total_samples_per_class = np.sum(self.client_stats_buffer, axis=0)
+            total_samples_per_class = np.sum(list(self.client_stats.values()), axis=0)
             total_samples_per_class[total_samples_per_class == 0] = 1  # Evita divisione per zero
 
             calibration_val = total_samples_per_class ** (-1 / 4)
@@ -265,7 +332,8 @@ class FederatedServer:
 
     def _on_client_update(self, data: Dict):
         with self.lock:
-            self.logger.info("Received update from client %s for round %d.", request.sid, data['round_number'])
+            client_id = self._client_key(data)
+            self.logger.info("Received update from client %s for round %d.", client_id, data['round_number'])
 
             if data['round_number'] != self.current_round:
                 self.logger.warning("Received an update for an old round (%d). Current is %d. Ignoring.",
@@ -275,8 +343,15 @@ class FederatedServer:
             try:
                 data['weights'] = pickle_string_to_object(data['weights'])
             except Exception as e:
-                self.logger.error("Error unpickling weights from client %s: %s", request.sid, e)
+                self.logger.error("Error unpickling weights from client %s: %s", client_id, e)
                 return
+
+            # Stamp the identity onto the update so the aggregator can pair it
+            # with the sender's label distribution in `client_stats`. Without
+            # this the two can only be matched by list position, which is wrong:
+            # updates arrive in whoever-finishes-first order.
+            data['client_id'] = client_id
+            data['sid'] = request.sid
 
             self.client_updates_this_round.append(data)
 
