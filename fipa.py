@@ -74,8 +74,9 @@ writing a line:
 Contents:
   - flatten_weights / unflatten_weights : between the framework's list-of-arrays
     representation and the single vector the maths needs.
-  - top_r_factors                       : WP3.1, client side. G -> (U_m, L_m).
-  - preconditioned_sum                  : WP3.2, server side. The core.
+  - top_r_factors                       : client side. G -> (U_m, L_m).
+  - explained_variance_ratio            : client side. Is r large enough?
+  - preconditioned_sum                  : server side. The core.
   - fipa_aggregate                      : the thin wrapper the aggregator calls.
 """
 
@@ -218,8 +219,8 @@ def top_r_factors(G: np.ndarray, rank: int, random_state: int = 42
 
     Why truncating is legitimate: the FIM spectrum of a network decays sharply -
     a few dominant eigenvalues and a long, nearly flat tail. Dropping the tail
-    costs little. Whether it is true *here* is exactly what the WP3.1 acceptance
-    criterion measures.
+    costs little. Whether it is true *here* - on this model, on this data - is
+    what `explained_variance_ratio` measures.
 
     Honesty note to carry into the report: the formula wants per-*sample*
     gradients, but PyTorch returns the mean gradient of a mini-batch. We collect
@@ -265,10 +266,9 @@ def top_r_factors(G: np.ndarray, rank: int, random_state: int = 42
 def explained_variance_ratio(G: np.ndarray, curvature: np.ndarray) -> float:
     """How much of the gradients' variance the `r` kept directions account for.
 
-    The second half of the WP3.1 acceptance criterion, and the number that
-    justifies `fipa_rank` in the report. Without it, r = 5 is a value we took
-    from the plan; with it, we can write "r = 5 captures 87% of the curvature on
-    GTSRB at alpha = 0.5" - or discover that it captures 40% and raise it.
+    The number that justifies `fipa_rank`. Without it, r = 5 is a value someone
+    picked; with it, we can write "r = 5 captures 87% of the curvature on GTSRB
+    at alpha = 0.5" - or discover that it captures 40% and raise it.
 
     The maths:
 

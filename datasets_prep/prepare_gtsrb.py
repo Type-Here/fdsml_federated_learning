@@ -255,7 +255,7 @@ def build_test_split(extract_dir: str, output_dir: str) -> Dict[int, int]:
 
 
 def verify_split(split: str, variant: str, output_dir: str, counts: Dict[int, int]) -> bool:
-    """Check the acceptance criteria for WP0.2: 43 non-empty classes, right total."""
+    """Check what a usable split needs: 43 non-empty classes, and the right total."""
     total = sum(counts.values())
     empty = [class_id for class_id, n in counts.items() if n == 0]
     expected = EXPECTED_COUNTS[(split, variant)]

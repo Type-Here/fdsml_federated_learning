@@ -92,7 +92,7 @@ class ExtendedAggregator(Aggregator):
         return denominator_for_algorithm(algorithm, total_training_size)
 
     # ------------------------------------------------------------------
-    # A1 - dispatch on the aggregation algorithm in the encrypted path too
+    # Dispatch on the aggregation algorithm in the encrypted path too
     # ------------------------------------------------------------------
     def aggregate_encrypted_updates(self, round_client_updates: List[Dict],
                                     algorithm: str = None) -> bool:
@@ -165,7 +165,7 @@ class ExtendedAggregator(Aggregator):
         return True
 
     # ------------------------------------------------------------------
-    # A4 - the method the server calls when weighted_aggregation is false
+    # The method the server calls when weighted_aggregation is false
     # ------------------------------------------------------------------
     def aggregate_train_loss(self, client_losses: List[float], current_round: int) -> None:
         """Unweighted mean of the clients' training losses.

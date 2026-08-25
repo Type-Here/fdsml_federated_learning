@@ -58,8 +58,8 @@ class ExtendedModelManager(ModelManager):
            make the "loss" a different random function on every batch, so the
            collected gradients would measure the dropout mask as much as the
            data. And BatchNorm in train mode updates its running statistics on
-           every forward pass: this pass would silently shift the statistics that
-           Part B's checkpoint depends on (CLAUDE.md 7G), on data seen in a
+           every forward pass: this pass would silently shift the normalization
+           statistics the exported global model carries, on data seen in a
            different order than during training.
 
         2. **No `optimizer.step()`, and gradients cleared afterwards.** This
@@ -90,7 +90,8 @@ class ExtendedModelManager(ModelManager):
                 whole training set. This caps both time and the memory `G`
                 takes: `n * p * 4` bytes, i.e. 36 MB for 64 batches at
                 p = 142379.
-            random_state: seed for the randomized SVD (A6: nothing unseeded).
+            random_state: seed for the randomized SVD, so two runs of the same
+                configuration produce the same factors.
             logger: optional; the explained-variance ratio is logged through it,
                 because that number is a result, not a diagnostic - it is what
                 justifies `fipa_rank` in the write-up.
