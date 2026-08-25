@@ -13,7 +13,9 @@ from aggregation_policy import (
     NO_RESCALING,
     SERVER_RETURNS_FINAL_MODEL,
     SUM_WEIGHTED_BY_SIZE,
+    WARMUP_ALGORITHM,
     client_denominator,
+    effective_algorithm,
     label_distribution_discrepancy,
 )
 
@@ -91,3 +93,62 @@ def test_empty_client_is_not_an_error():
     """A client with no samples has no distribution to be skewed."""
     assert label_distribution_discrepancy([]) == 0.0
     assert label_distribution_discrepancy([0, 0, 0]) == 0.0
+
+# ---------------------------------------------------------------------------
+# effective_algorithm - the warmup schedule
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("algorithm", ["FedAvg", "FedProx", "FedLC", "FedDisco"])
+def test_algorithms_without_warmup_are_never_substituted(algorithm):
+    """Only FIPA warms up. Everything else runs from round 0, warmup or not."""
+    for round_number in (0, 1, 50):
+        assert effective_algorithm(algorithm, round_number, warmup_rounds=8) == algorithm
+
+
+def test_fipa_runs_fedavg_during_the_warmup():
+    """A low-rank Fisher estimate is informative only near a minimum."""
+    assert effective_algorithm("FIPA", 0, warmup_rounds=8) == WARMUP_ALGORITHM
+    assert effective_algorithm("FIPA", 7, warmup_rounds=8) == WARMUP_ALGORITHM
+
+
+def test_fipa_takes_over_exactly_at_the_boundary():
+    """Rounds count from 0, so `warmup_rounds=8` means rounds 0..7 warm up.
+
+    The off-by-one here is the whole risk of the feature: one round early and
+    the clients divide a finished model by N; one round late and they fail to
+    divide a weighted sum. Neither raises.
+    """
+    assert effective_algorithm("FIPA", 8, warmup_rounds=8) == "FIPA"
+    assert effective_algorithm("FIPA", 9, warmup_rounds=8) == "FIPA"
+
+
+def test_zero_warmup_means_fipa_from_the_first_round():
+    assert effective_algorithm("FIPA", 0, warmup_rounds=0) == "FIPA"
+
+
+def test_warmup_longer_than_the_run_never_reaches_fipa():
+    """A config mistake worth being able to see in the results, not a crash."""
+    assert effective_algorithm("FIPA", 9, warmup_rounds=100) == WARMUP_ALGORITHM
+
+
+def test_effective_algorithm_rejects_nonsense():
+    with pytest.raises(ValueError, match="Unknown aggregation algorithm"):
+        effective_algorithm("FedSomethingNew", 0, warmup_rounds=0)
+    with pytest.raises(ValueError, match="warmup_rounds"):
+        effective_algorithm("FIPA", 0, warmup_rounds=-1)
+
+
+def test_the_denominator_follows_the_effective_algorithm():
+    """The reason `effective_algorithm` exists at all.
+
+    During the warmup FIPA *is* FedAvg: the server sends a weighted sum and the
+    client must divide by N. Only from the refinement round on is the payload a
+    finished model that must not be rescaled. Composing the two functions is how
+    the server gets this right without knowing anything about warmups.
+    """
+    total = 5000
+    warmup = effective_algorithm("FIPA", 3, warmup_rounds=8)
+    refinement = effective_algorithm("FIPA", 8, warmup_rounds=8)
+
+    assert client_denominator(warmup, total) == float(total)
+    assert client_denominator(refinement, total) == NO_RESCALING
