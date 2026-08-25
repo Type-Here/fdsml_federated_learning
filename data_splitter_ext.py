@@ -90,6 +90,7 @@ class PartitionedDatasetSplitter(DatasetSplitter):
                  partition_unit: str = UNIT_TRACK,
                  min_samples_per_client: int = 10,
                  max_resample_attempts: int = 50,
+                 max_units_per_class: Optional[int] = None,
                  seed: int = DEFAULT_SEED):
         """
         Args:
@@ -107,6 +108,9 @@ class PartitionedDatasetSplitter(DatasetSplitter):
             min_samples_per_client: reject a draw that leaves any client with
                 fewer images than this, and draw again.
             max_resample_attempts: how many draws to try before giving up.
+            max_units_per_class: cap the units taken from each class. `None`
+                (the default) uses the whole dataset; a small value is the
+                smoke-test lever, and must never be set for a real run.
             seed: seeds the Dirichlet draws and the train/valid splits, so the
                 same configuration always produces the same partition.
         """
@@ -134,6 +138,8 @@ class PartitionedDatasetSplitter(DatasetSplitter):
         self.partition_unit = partition_unit
         self.min_samples_per_client = int(min_samples_per_client)
         self.max_resample_attempts = int(max_resample_attempts)
+        self.max_units_per_class = (None if max_units_per_class is None
+                                    else int(max_units_per_class))
         self.seed = int(seed)
 
         # Filled in by the Dirichlet path: one row per client, one column per
@@ -162,6 +168,7 @@ class PartitionedDatasetSplitter(DatasetSplitter):
             partition_unit=config.get("partition_unit", UNIT_TRACK),
             min_samples_per_client=int(config.get("min_samples_per_client", 10)),
             max_resample_attempts=int(config.get("max_resample_attempts", 50)),
+            max_units_per_class=config.get("max_units_per_class"),
             seed=int(config.get("seed", DEFAULT_SEED)),
         )
 
@@ -182,6 +189,8 @@ class PartitionedDatasetSplitter(DatasetSplitter):
         unit_members, unit_labels = self._build_units()
         print(f"  {len(self.dataframe)} images grouped into {len(unit_members)} "
               f"{self.partition_unit}(s).")
+
+        unit_members, unit_labels = self._limit_units_per_class(unit_members, unit_labels)
 
         client_units = self._partition_units_dirichlet(unit_members, unit_labels)
         self._materialise_clients(client_units, unit_members, unit_labels,
@@ -226,6 +235,46 @@ class PartitionedDatasetSplitter(DatasetSplitter):
         unit_members = [np.array(groups[key]) for key in keys]
         unit_labels = np.array([key[0] for key in keys])
         return unit_members, unit_labels
+
+    def _limit_units_per_class(self,
+                               unit_members: Sequence[np.ndarray],
+                               unit_labels: np.ndarray) -> Tuple[List[np.ndarray], np.ndarray]:
+        """Keep at most `max_units_per_class` units of each class.
+
+        A smoke-test lever, not an experimental one. The full GTSRB training set
+        is 26640 images, and copying all of them into per-client directories
+        before a two-round sanity check wastes more time than the check itself.
+        With `max_units_per_class=2` and tracks as units the run sees 2 x 30 x 43
+        = 2580 images, enough to exercise every code path.
+
+        The subset is drawn with the run's seed, so it is random but
+        reproducible; taking the first N units of each class instead would bias
+        the sample towards low track ids.
+
+        Returns the inputs unchanged when the option is not set, which is the
+        default for every real run.
+        """
+        if self.max_units_per_class is None:
+            return list(unit_members), unit_labels
+
+        rng = np.random.default_rng(self.seed)
+        kept: List[int] = []
+        for class_index in np.unique(unit_labels):
+            units_of_class = np.where(unit_labels == class_index)[0]
+            if len(units_of_class) > self.max_units_per_class:
+                units_of_class = rng.choice(
+                    units_of_class, size=self.max_units_per_class, replace=False
+                )
+            kept.extend(int(unit) for unit in units_of_class)
+
+        kept.sort()
+        limited_members = [unit_members[unit] for unit in kept]
+        limited_labels = unit_labels[kept]
+        kept_images = sum(len(members) for members in limited_members)
+        print(f"  Subsampled to at most {self.max_units_per_class} "
+              f"{self.partition_unit}(s) per class: {len(kept)} unit(s), "
+              f"{kept_images} images. THIS IS NOT A FULL RUN.")
+        return limited_members, limited_labels
 
     # ------------------------------------------------------------------
     # Step 2 - the Dirichlet draw
