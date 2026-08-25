@@ -239,6 +239,41 @@ def test_stratified_strategy_still_uses_the_inherited_split(source_dir, tmp_path
 # Guard rails
 # ---------------------------------------------------------------------------
 
+def test_max_units_per_class_subsamples_reproducibly(source_dir, tmp_path):
+    """The smoke-test lever: fewer units per class, same set for the same seed."""
+    first = tmp_path / "first"
+    make_splitter(source_dir, first, max_units_per_class=3).split_dataset()
+
+    entries = collect_assignment(first)
+    expected = NUM_CLASSES * 3 * FRAMES_PER_TRACK
+    assert len(entries) == expected
+
+    tracks_per_class = defaultdict(set)
+    for class_dir, filename, _, _ in entries:
+        tracks_per_class[class_dir].add(track_of(filename))
+    for class_dir, tracks in tracks_per_class.items():
+        assert len(tracks) == 3, f"class {class_dir} kept {len(tracks)} tracks"
+
+    second = tmp_path / "second"
+    make_splitter(source_dir, second, max_units_per_class=3).split_dataset()
+    assert sorted(collect_assignment(first)) == sorted(collect_assignment(second))
+
+
+def test_max_units_per_class_none_keeps_everything(source_dir, tmp_path):
+    """The default must not subsample: every real run relies on it."""
+    output_dir = tmp_path / "out"
+    make_splitter(source_dir, output_dir, max_units_per_class=None).split_dataset()
+    assert len(collect_assignment(output_dir)) == TOTAL_IMAGES
+
+
+def test_max_units_per_class_above_the_supply_is_harmless(source_dir, tmp_path):
+    """Asking for more tracks than a class has keeps all of them, no error."""
+    output_dir = tmp_path / "out"
+    make_splitter(source_dir, output_dir,
+                  max_units_per_class=TRACKS_PER_CLASS + 10).split_dataset()
+    assert len(collect_assignment(output_dir)) == TOTAL_IMAGES
+
+
 def test_alpha_too_small_for_the_client_count_fails_loudly(source_dir, tmp_path):
     """Better an explicit error than a client with an empty dataset."""
     splitter = make_splitter(
