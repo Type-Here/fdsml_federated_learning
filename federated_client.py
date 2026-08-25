@@ -10,6 +10,9 @@ import threading
 from model_manager import ModelManager
 from utils import object_to_pickle_string, pickle_string_to_object, encrypt_weights, decrypt_weights
 
+import fipa
+from model_manager_ext import ExtendedModelManager
+
 
 class ContextFilter(logging.Filter):
     """A logging filter to add client_id context to log records."""
@@ -37,6 +40,22 @@ class FederatedClient:
         self.logger: logging.LoggerAdapter = self._setup_logger()
 
         self.encryption_mode: str = self.config.get('encryption_mode', 'none')
+
+        # Fail here rather than eight rounds in. FIPA's encrypted variant 
+        # not implemented yet: the server would raise
+        # on the first refinement round, after a full warmup has already been
+        # paid for. The warmup itself would run fine, which is exactly what
+        # makes the late failure confusing.
+        if (self.config.get('aggregation_algorithm') == 'FIPA'
+                and self.encryption_mode != 'no_encryption'):
+            self.logger.error(
+                "FIPA is only implemented on the plaintext path, but "
+                "encryption_mode is '%s'. Set encryption_mode to "
+                "'no_encryption' for FIPA runs.", self.encryption_mode)
+            raise ValueError(
+                f"FIPA does not support encryption_mode='{self.encryption_mode}'."
+            )
+
         if self.encryption_mode != 'no_encryption':
             self.logger.info("Encryption enabled. Keys will be requested from the Trusted Authority.")
             self.paillier_pubkey = None
@@ -192,8 +211,10 @@ class FederatedClient:
     def _initialize_model_and_report_ready(self):
         self.logger.info("Initializing local model.")
 
-        # --- MODIFICA CHIAVE: Istanza del nuovo ModelManager ---
-        self.local_model = ModelManager(
+        # `ExtendedModelManager` behaves exactly like `ModelManager` unless
+        # `collect_gradient_factors` is called, which only FIPA rounds do. Using
+        # it unconditionally keeps this to one line instead of a branch.
+        self.local_model = ExtendedModelManager(
             config=self.config,
             dataset_path=self.dataset_path
         )
@@ -221,6 +242,64 @@ class FederatedClient:
         worker_thread.daemon = True
         worker_thread.start()
 
+    def _round_algorithm(self, data: Dict) -> str:
+        """Which aggregation rule governs this round.
+
+        The server decides and says so in the round payload, because the rule
+        can change mid-run: FIPA spends its first `fipa_warmup_rounds` rounds
+        behaving as FedAvg (`aggregation_policy.effective_algorithm`). Deciding
+        it here instead would mean two files computing the same warmup boundary
+        and one of them eventually getting it wrong by a round - which produces
+        no error, only a model divided by N when it should not have been.
+
+        The fallback is for a server that predates this key.
+        """
+        return data.get('aggregation_algorithm',
+                        self.config.get("aggregation_algorithm", "FedAvg"))
+
+    def _build_fipa_update(self, global_weights, local_weights, data: Dict) -> Dict:
+        """The extra payload of a FIPA round: the delta and the curvature.
+
+        Returns the keys to merge into the `client_update` message:
+
+            weights      Delta_m = theta_m - theta_global, in the same
+                         list-of-arrays shape as ordinary weights, so the wire
+                         format does not change type between rounds.
+            payload_kind 'delta', so the server can refuse to aggregate deltas
+                         as if they were absolute parameters.
+            fipa_U       U_m, the top-r curvature directions, (p, r) float32.
+            fipa_lambda  L_m, the matching eigenvalues, (r,) float32.
+            fipa_explained_variance
+                         how much of the gradients' variance those r directions
+                         account for. Not used by the aggregation - it is a
+                         result: it is what tells us whether `fipa_rank` is big
+                         enough on this model and this data.
+
+        Why the client computes the delta and not the server: the server could
+        subtract, since it knows what it broadcast, but only in plaintext. Doing
+        it here keeps the door open for an encrypted FIPA, where the server
+        cannot form `-theta_global` at all (it holds no public key). The
+        subtraction is free anyway - both vectors are already in this method.
+        """
+        global_flat, _ = fipa.flatten_weights(global_weights)
+        local_flat, shapes = fipa.flatten_weights(local_weights)
+        delta = fipa.unflatten_weights(local_flat - global_flat, shapes)
+
+        directions, curvature, explained = self.local_model.collect_gradient_factors(
+            batch_size=data['batch_size'],
+            rank=int(self.config.get('fipa_rank', 5)),
+            max_batches=self.config.get('fipa_grad_batches'),
+            random_state=int(self.config.get('seed', 42)),
+            logger=self.logger,
+        )
+        return {
+            'weights': object_to_pickle_string(delta),
+            'payload_kind': 'delta',
+            'fipa_U': object_to_pickle_string(directions),
+            'fipa_lambda': object_to_pickle_string(curvature),
+            'fipa_explained_variance': explained,
+        }
+
     def _update_worker(self, data: Dict):
         try:
             self.logger.info("Worker thread started for round %s.", data['round_number'])
@@ -231,9 +310,10 @@ class FederatedClient:
 
             self.local_model.set_weights(averaged_weights)
 
+            algorithm = self._round_algorithm(data)
             _, train_map, train_loss, train_size = self.local_model.train(
                 epochs=data['epochs'], lr=data['learning_rate'], batch_size=data['batch_size'],
-                algorithm=self.config.get("aggregation_algorithm", "FedAvg"),
+                algorithm=algorithm,
                 global_weights=averaged_weights, mu=self.config.get("fedprox_mu", 0.0)
             )
             local_weights = self.local_model.get_weights()
@@ -251,8 +331,17 @@ class FederatedClient:
                 train_map['f1_score'],
                 'avg_acc': np.mean(list(train_map['accuracy'])) if isinstance(train_map['accuracy'], list) else
                 train_map['accuracy'],
-                'train_size': train_size, 'weights': object_to_pickle_string(weights_to_send)
+                'train_size': train_size, 'weights': object_to_pickle_string(weights_to_send),
+                'payload_kind': 'weights',
             }
+
+            # A FIPA round replaces the absolute weights with the delta and adds
+            # the curvature factors. Done after `response` is built, so a warmup
+            # round is byte for byte what it was before this feature existed.
+            if algorithm == 'FIPA':
+                self.logger.info("Round %s is a FIPA refinement round: collecting "
+                                 "curvature factors.", data['round_number'])
+                response.update(self._build_fipa_update(averaged_weights, local_weights, data))
             self.logger.info("Worker thread: Sending client update for round %s.", data['round_number'])
             self.sio.emit('client_update', response)
             self.logger.info("--- Worker thread Round %s Training Summary ---", data['round_number'])
