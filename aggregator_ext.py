@@ -11,6 +11,9 @@ Everything the base class already does correctly is inherited untouched:
 `get_parameter_plots`, the best-model bookkeeping and the early stopping.
 
 Contents:
+  - `begin_round`                 : the aggregation keys the server puts in the
+    round payload, plus the snapshot of the parameters it is broadcasting.
+  - `aggregate_weights`           : dispatch on the algorithm, including FIPA.
   - `aggregate_encrypted_updates` : makes the encrypted path honor the
     configured aggregation algorithm instead of always weighting by size.
   - `aggregate_train_loss`        : a method the server calls but the base class
@@ -20,23 +23,28 @@ Contents:
   - `client_denominator`          : what the client must divide the round
     payload by, forwarded from `aggregation_policy`.
 
-The algorithm families and the denominator rule live in `aggregation_policy`,
-which imports neither `aggregator` nor torch and is therefore testable on a
-machine without a GPU stack. This file is the part that has to touch tensors.
+The algorithm families, the warmup boundary and the denominator rule live in
+`aggregation_policy`, which imports neither `aggregator` nor torch and is
+therefore testable on a machine without a GPU stack; the linear algebra of FIPA
+lives in `fipa.py`, torch-free for the same reason. This file is the part that
+has to touch tensors, and it is deliberately thin.
 
-Deliberately not here yet: the FedDisco branches, the FIPA branch, and the
-global model checkpoint.
+Deliberately not here yet: the FedDisco branches and the global model
+checkpoint.
 """
 
 import logging
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 
-from aggregation_policy import SUM_WEIGHTED_BY_SIZE
+import fipa
+from aggregation_policy import NEEDS_GLOBAL_WEIGHTS, SUM_WEIGHTED_BY_SIZE
 from aggregation_policy import client_denominator as denominator_for_algorithm
+from aggregation_policy import effective_algorithm as effective_algorithm_for_round
 from aggregator import Aggregator
-from utils import multiply_encrypted_weights_by_scalar, sum_encrypted_weights
+from utils import (multiply_encrypted_weights_by_scalar, pickle_string_to_object,
+                   sum_encrypted_weights)
 
 
 class ExtendedAggregator(Aggregator):
@@ -50,11 +58,138 @@ class ExtendedAggregator(Aggregator):
         # (FedAvg, FedProx, FedLC) never looks.
         self.client_stats: Dict[str, np.ndarray] = {}
 
+        # Which rule produced what is currently in `current_weights`. None until
+        # the first aggregation. This is NOT the same as the rule governing the
+        # round about to run - see `client_denominator` for why the distinction
+        # is the whole point.
+        self.last_aggregation_algorithm: Optional[str] = None
+
+        # The round the server most recently opened, and the parameters it
+        # broadcast for it. FIPA needs the latter: its clients send deltas
+        # relative to those parameters, and the server has to add the increment
+        # back onto the same starting point.
+        self.round_number: int = 0
+        self.global_weights: Optional[List[np.ndarray]] = None
+
+        algorithm = self.config.get("aggregation_algorithm", "FedAvg")
+        encryption_mode = self.config.get("encryption_mode", "no_encryption")
+
+        # Fail here rather than at the first refinement round. Under encryption
+        # the FIPA branch would raise anyway, but only after the warmup has
+        # already burned most of the run's compute budget. The client raises the
+        # same way, so a misconfigured run dies at startup on both sides.
+        if algorithm == "FIPA" and encryption_mode != "no_encryption":
+            raise ValueError(
+                f"FIPA is only implemented on the plaintext path, but "
+                f"encryption_mode is '{encryption_mode}'. Its server-side rule "
+                f"needs a QR and an eigendecomposition, which Paillier cannot "
+                f"do. Set encryption_mode to 'no_encryption' for FIPA runs."
+            )
+
+        if algorithm == "FIPA" and self.warmup_rounds == 0:
+            self.logger.warning(
+                "FIPA is configured with fipa_warmup_rounds = 0, so the "
+                "preconditioner is built from the curvature at initialization. "
+                "Far from any optimum the Fisher information is dominated by "
+                "whichever direction the initialization happened to make steep."
+            )
+
         self.logger.info(
-            "Using ExtendedAggregator (algorithm=%s, encryption=%s).",
-            self.config.get("aggregation_algorithm"),
-            self.config.get("encryption_mode"),
+            "Using ExtendedAggregator (algorithm=%s, encryption=%s, warmup=%d).",
+            algorithm, encryption_mode, self.warmup_rounds,
         )
+
+    # ------------------------------------------------------------------
+    # Which rule governs which round
+    # ------------------------------------------------------------------
+    @property
+    def warmup_rounds(self) -> int:
+        """How many rounds run as plain FedAvg before the configured rule takes over.
+
+        Config key `fipa_warmup_rounds`. 0 for every algorithm that does not
+        warm up, which is all of them except FIPA.
+        """
+        return int(self.config.get("fipa_warmup_rounds", 0))
+
+    def effective_algorithm(self, round_number: int) -> str:
+        """The rule that governs `round_number`, warmup accounted for.
+
+        Thin forwarder to `aggregation_policy.effective_algorithm`, bound to
+        this run's configuration, so that the server never has to know the
+        warmup rule exists.
+        """
+        return effective_algorithm_for_round(
+            self.config.get("aggregation_algorithm", "FedAvg"),
+            round_number,
+            self.warmup_rounds,
+        )
+
+    def begin_round(self, round_number: int, total_training_size: int) -> Dict:
+        """The aggregation keys of `request_update`, and the broadcast snapshot.
+
+        Called by the server once per round, while it builds the payload. It
+        returns the two keys the client needs and, as a side effect, remembers
+        what is being broadcast so that a FIPA aggregation can add its increment
+        to the right starting point.
+
+        The two keys answer *different* questions about *different* rounds, and
+        conflating them is the subtle bug this method exists to prevent:
+
+            aggregation_algorithm  -> the rule for the round ABOUT TO RUN.
+                                      Tells the client whether to spend an extra
+                                      pass collecting curvature factors.
+
+            aggregation_denominator-> describes what is IN the payload, i.e. the
+                                      output of the PREVIOUS aggregation.
+
+        They differ exactly once per run, at the warmup boundary:
+
+            round 7 (FedAvg)  -> current_weights = sum_k n_k W_k = N * theta
+            round 8 (FIPA)    -> broadcasts that same content
+                                 algorithm  = "FIPA"   (what to do now)
+                                 denominator = N       (what the payload is)
+
+        Reading the denominator off the upcoming round instead would send 1.0
+        there, and every client would train from a model scaled by N. That is
+        not an error anywhere, only a run that does not converge.
+
+        Args:
+            round_number: the round being opened, from 0.
+            total_training_size: `N` of the round that was just aggregated.
+
+        Returns:
+            `{'aggregation_algorithm': str, 'aggregation_denominator': float}`.
+        """
+        self.round_number = round_number
+        algorithm = self.effective_algorithm(round_number)
+        denominator = self.client_denominator(total_training_size)
+
+        # Only the delta-sending rules need theta, and keeping the snapshot to
+        # the rounds that use it avoids copying the parameters every round for
+        # nothing. It also keeps this away from the encrypted path, where
+        # `current_weights` holds Paillier ciphertext dicts that cannot be
+        # divided at all.
+        if algorithm in NEEDS_GLOBAL_WEIGHTS:
+            self._snapshot_global_weights(denominator)
+
+        return {
+            'aggregation_algorithm': algorithm,
+            'aggregation_denominator': denominator,
+        }
+
+    def _snapshot_global_weights(self, denominator: float) -> None:
+        """Remember theta: exactly what the clients will reconstruct.
+
+        The arithmetic mirrors `federated_client._process_server_weights` line
+        for line, on purpose - the server's theta and the clients' theta have to
+        be the same numbers, or the deltas are relative to a model nobody
+        trained. A denominator of 0 means round 0, where the payload is the
+        initial weights rather than a sum and the client uses it unscaled.
+        """
+        if denominator > 0:
+            self.global_weights = [w / denominator for w in self.current_weights]
+        else:
+            self.global_weights = [np.array(w, copy=True) for w in self.current_weights]
 
     # ------------------------------------------------------------------
     # The per-client label distributions a discrepancy-aware rule needs
@@ -83,13 +218,162 @@ class ExtendedAggregator(Aggregator):
     def client_denominator(self, total_training_size: int) -> float:
         """The divisor the server puts in the round payload.
 
-        Thin forwarder to `aggregation_policy.client_denominator`, bound to this
-        run's configured algorithm. It exists so the server does not have to
-        know the algorithm families, and so a subclass could override the rule
-        without the server changing.
+        Forwards to `aggregation_policy.client_denominator`, bound to **the rule
+        that produced what is currently in `current_weights`** - not to the one
+        configured, and not to the one governing the round about to start.
+
+        Why that distinction is the entire point. The denominator describes the
+        *payload*, and the payload is whatever the last aggregation left behind:
+
+            FedAvg aggregated   -> current_weights = sum_k n_k W_k  -> divide by N
+            FIPA aggregated     -> current_weights = theta          -> divide by 1
+
+        With FIPA configured and a warmup, reading the algorithm off the config
+        would answer 1.0 for the whole run, including the warmup rounds where
+        the payload really is a size-weighted sum. Reading it off the *upcoming*
+        round would get the warmup right and then be wrong exactly once, at the
+        boundary round, which is the hardest possible failure to notice.
+
+        Before the first aggregation there is nothing to describe, so the answer
+        falls back to round 0's own rule. For the size-weighted family that is
+        `float(0)`, which the client reads as "use the weights as they are" -
+        correct, because round 0's payload is the initial parameters and not a
+        sum.
         """
-        algorithm = self.config.get("aggregation_algorithm", "FedAvg")
+        algorithm = self.last_aggregation_algorithm or self.effective_algorithm(0)
         return denominator_for_algorithm(algorithm, total_training_size)
+
+    # ------------------------------------------------------------------
+    # Plaintext aggregation: dispatch on the algorithm
+    # ------------------------------------------------------------------
+    def aggregate_weights(self, client_updates: List[Dict], algorithm: str) -> bool:
+        """Aggregate plaintext updates, routing FIPA to its own rule.
+
+        The base class handles the size-weighted family and raises for anything
+        else (`aggregator.py:74`). This override keeps that behavior, adds the
+        FIPA branch, and records which rule ran so that `client_denominator` can
+        describe the result.
+
+        It also checks `payload_kind` before doing anything. The two families
+        put different things in `weights` - absolute parameters for FedAvg,
+        deltas for FIPA - and they are the same type and shape, so mixing them
+        produces no error at all: a delta summed as if it were a parameter
+        vector gives a model near zero, and a parameter vector aggregated as a
+        delta doubles theta. Both look like divergence, not like a bug.
+
+        Args:
+            client_updates: this round's updates, weights already unpickled.
+            algorithm: the *effective* algorithm for this round - the server
+                passes what `effective_algorithm` returned, so a warmup round
+                arrives here as "FedAvg".
+
+        Returns:
+            True if `self.current_weights` was updated.
+        """
+        if algorithm in SUM_WEIGHTED_BY_SIZE:
+            self._require_payload_kind(client_updates, 'weights', algorithm)
+            aggregated = super().aggregate_weights(client_updates, algorithm)
+        elif algorithm == 'FIPA':
+            self._require_payload_kind(client_updates, 'delta', algorithm)
+            aggregated = self._aggregate_fipa(client_updates)
+        else:
+            raise ValueError(f"Aggregation algorithm '{algorithm}' is not supported.")
+
+        if aggregated:
+            self.last_aggregation_algorithm = algorithm
+        return aggregated
+
+    @staticmethod
+    def _require_payload_kind(client_updates: List[Dict], expected: str,
+                              algorithm: str) -> None:
+        """Refuse a round whose updates carry the wrong kind of payload.
+
+        `payload_kind` is stamped by the client (`federated_client.py`); an
+        update from a client that predates the key is read as 'weights', which
+        is what it was.
+        """
+        for update in client_updates:
+            kind = update.get('payload_kind', 'weights')
+            if kind != expected:
+                raise ValueError(
+                    f"{algorithm} expects updates of kind '{expected}', but "
+                    f"client '{update.get('client_id', '?')}' sent "
+                    f"'{kind}'. The server and the client disagree on which "
+                    f"rule governs this round."
+                )
+
+    def _aggregate_fipa(self, client_updates: List[Dict]) -> bool:
+        """`theta <- theta + sum_m B_m Delta_m`.
+
+        All this does is unpack the round into the shape `fipa.py` wants and
+        hand the result back. The linear algebra - the empirical Fisher matrices
+        in low-rank form, the consensus curvature, the pseudo-inverse - is in
+        `fipa.preconditioned_sum`, deliberately torch-free so it can be unit
+        tested without a GPU stack.
+
+        Each update carries, besides the usual `train_size`:
+            weights     Delta_m, this client's movement during local training,
+                        in the framework's list-of-arrays form;
+            fipa_U      U_m, its top-r curvature directions, (p, r);
+            fipa_lambda L_m, the matching eigenvalues, (r,);
+            fipa_explained_variance
+                        how much of the gradients' variance those r directions
+                        account for. Not used by the aggregation - it is a
+                        result, and it goes into the per-round metrics so that
+                        `fipa_rank` can be justified rather than asserted.
+
+        `fipa_U` and `fipa_lambda` arrive still pickled: the server unpickles
+        only `weights` (`federated_server.py:344`), and leaving the FIPA-specific
+        keys to be opened here keeps that received handler free of any knowledge
+        about this algorithm.
+
+        Returns:
+            True. Failure raises instead, because a FIPA round that silently
+            did nothing would leave the previous parameters in place and look
+            like a plateau.
+
+        Raises:
+            RuntimeError: if no broadcast snapshot exists - `begin_round` was
+                never called, so the server does not know what the clients
+                started from.
+            ValueError: if an update is missing its curvature factors.
+        """
+        if self.global_weights is None:
+            raise RuntimeError(
+                "FIPA aggregation without a broadcast snapshot: the server did "
+                "not record the parameters it sent out this round, so the "
+                "clients' deltas have nothing to be added to."
+            )
+
+        factors = []
+        explained = []
+        for update in client_updates:
+            if 'fipa_U' not in update or 'fipa_lambda' not in update:
+                raise ValueError(
+                    f"Client '{update.get('client_id', '?')}' sent a FIPA delta "
+                    f"without its curvature factors."
+                )
+            delta, _ = fipa.flatten_weights(update['weights'])
+            factors.append(fipa.ClientFactors(
+                delta=delta,
+                directions=pickle_string_to_object(update['fipa_U']),
+                curvature=pickle_string_to_object(update['fipa_lambda']),
+                n_samples=float(update['train_size']),
+            ))
+            explained.append(float(update.get('fipa_explained_variance', np.nan)))
+
+        rtol = float(self.config.get('fipa_pinv_rtol', fipa.DEFAULT_PINV_RTOL))
+        self.current_weights = fipa.fipa_aggregate(self.global_weights, factors, rtol)
+
+        mean_explained = float(np.nanmean(explained)) if explained else float('nan')
+        self.metrics_history.setdefault(self.round_number, {})[
+            'fipa_explained_variance'] = mean_explained
+        self.logger.info(
+            "FIPA aggregation complete over %d clients (rank per client: %s). "
+            "Mean explained variance %.4f.",
+            len(factors), [c.curvature.shape[0] for c in factors], mean_explained,
+        )
+        return True
 
     # ------------------------------------------------------------------
     # Dispatch on the aggregation algorithm in the encrypted path too
@@ -125,7 +409,11 @@ class ExtendedAggregator(Aggregator):
             return False
 
         if algorithm in SUM_WEIGHTED_BY_SIZE:
-            return self._encrypted_sum_weighted_by_size(round_client_updates)
+            self._require_payload_kind(round_client_updates, 'weights', algorithm)
+            aggregated = self._encrypted_sum_weighted_by_size(round_client_updates)
+            if aggregated:
+                self.last_aggregation_algorithm = algorithm
+            return aggregated
 
         # FedDisco and any future rule land here. Raising rather than
         # silently falling back to FedAvg is the whole point of this fix: a
