@@ -72,6 +72,17 @@ NEEDS_WARMUP = ("FIPA",)
 # warmup is meant to be the neutral baseline the refinement is measured against.
 WARMUP_ALGORITHM = "FedAvg"
 
+# Algorithms whose clients send a *delta* rather than absolute parameters, so
+# the server has to remember theta - the parameters it broadcast - to add the
+# aggregated increment back onto.
+#
+# Deliberately not the same set as SERVER_RETURNS_FINAL_MODEL, even though FIPA
+# is in both. FedDisco's output is also a finished model, but its clients send
+# absolute weights and its server never needs to know what it broadcast; making
+# it take the snapshot too would break the moment it runs encrypted, where
+# `current_weights` holds Paillier ciphertexts that cannot be divided at all.
+NEEDS_GLOBAL_WEIGHTS = ("FIPA",)
+
 
 def effective_algorithm(algorithm: str, round_number: int,
                         warmup_rounds: int = 0) -> str:
