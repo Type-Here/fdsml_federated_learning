@@ -68,25 +68,40 @@ class FederatedClient:
 
     def _setup_logger(self) -> logging.LoggerAdapter:
         worker_id = self.config.get('worker_id', 'N/A')
-        logger_name = f"FederatedClient-W{worker_id}"
+        # One logger per client, not one per worker. A worker runs all of its
+        # clients as threads in the same process, so a name shared across them
+        # meant a single file handler - created by whichever client was built
+        # first - collected every client's lines and stamped them all with that
+        # client's id.
+        logger_name = f"FederatedClient-W{worker_id}-{self.client_id}"
         base_logger = logging.getLogger(logger_name)
 
-        if not base_logger.hasHandlers():
-            datestr = time.strftime('%d%m')
-            timestr = time.strftime('%m%d%H%M')
-            log_dir_base = self.config.get('log_dir', 'logs')
-            log_dir = os.path.join(log_dir_base, datestr, "FL-Client-LOG")
-            os.makedirs(log_dir, exist_ok=True)
-            file_handler = logging.FileHandler(os.path.join(log_dir, f'{timestr}_{self.client_id}.log'))
-            file_handler.setLevel(logging.INFO)
-            stream_handler = logging.StreamHandler()
-            stream_handler.setLevel(logging.WARN)
-            formatter = logging.Formatter('%(asctime)s - %(client_id)s - %(levelname)s - %(message)s')
-            file_handler.setFormatter(formatter)
-            stream_handler.setFormatter(formatter)
-            base_logger.setLevel(logging.INFO)
-            base_logger.addHandler(file_handler)
-            base_logger.addHandler(stream_handler)
+        # A worker dequeues several configurations one after the other in the
+        # same process, so this logger may still hold the previous run's file
+        # handler. Drop it, or the second run's lines are appended to the first
+        # run's file and the two become impossible to tell apart.
+        for stale_handler in list(base_logger.handlers):
+            base_logger.removeHandler(stale_handler)
+            stale_handler.close()
+
+        datestr = time.strftime('%d%m')
+        # Seconds included: two configurations dequeued by the same worker
+        # within the same minute would otherwise reopen the same file in
+        # append mode, undoing the handler reset above.
+        timestr = time.strftime('%m%d%H%M%S')
+        log_dir_base = self.config.get('log_dir', 'logs')
+        log_dir = os.path.join(log_dir_base, datestr, "FL-Client-LOG")
+        os.makedirs(log_dir, exist_ok=True)
+        file_handler = logging.FileHandler(os.path.join(log_dir, f'{timestr}_{self.client_id}.log'))
+        file_handler.setLevel(logging.INFO)
+        stream_handler = logging.StreamHandler()
+        stream_handler.setLevel(logging.WARN)
+        formatter = logging.Formatter('%(asctime)s - %(client_id)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(formatter)
+        stream_handler.setFormatter(formatter)
+        base_logger.setLevel(logging.INFO)
+        base_logger.addHandler(file_handler)
+        base_logger.addHandler(stream_handler)
 
         adapter = logging.LoggerAdapter(base_logger, {'client_id': self.client_id})
         log_filter = ContextFilter(self.client_id)
@@ -172,8 +187,16 @@ class FederatedClient:
     def _on_connect(self):
         self.logger.info("Successfully connected with SID: %s", self.sio.sid)
 
-    def _on_disconnect(self):
-        self.logger.info("Disconnected from the server."); self.sio.disconnect()
+    def _on_disconnect(self, reason: str = None):
+        # `reason` is optional because python-socketio only started passing it
+        # to disconnect handlers in 5.12; older pinned versions call this with
+        # no argument at all.
+        #
+        # Do not call self.sio.disconnect() here. This handler runs inside the
+        # read loop thread, and disconnect() joins that very thread, which
+        # raises "cannot join current thread". There is nothing to close
+        # anyway: by the time this fires the connection is already gone.
+        self.logger.info("Disconnected from the server. Reason: %s", reason or "not reported")
 
     def _on_reconnect(self):
         self.logger.info("Reconnected to the server.")
