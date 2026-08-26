@@ -17,6 +17,7 @@ import queue
 from config_fingerprint import (
     EXTRA_FINGERPRINT_KEYS,
     get_config_fingerprint,
+    normalize_fipa_keys,
     normalize_partition_keys,
 )
 from trusted_authority import TrustedAuthority
@@ -230,6 +231,7 @@ def main(config_path: str = GRID_SEARCH_CONFIG_PATH):
                 model_name_from_row = row.get('model_name', '')
                 if row.get('aggregation_algorithm') != "FedProx": row['fedprox_mu'] = '0.0'
                 normalize_partition_keys(row)
+                normalize_fipa_keys(row)
                 if 'ResNet' in model_name_from_row or 'GoogLeNet' in model_name_from_row or 'AlexNet' in model_name_from_row:
                     row.setdefault('image_size', '224')
                     row.setdefault('convnet_hidden1', '-1')
@@ -263,8 +265,9 @@ def main(config_path: str = GRID_SEARCH_CONFIG_PATH):
 
                 if hyper_config.get('aggregation_algorithm') != "FedProx": hyper_config['fedprox_mu'] = 0.0
                 normalize_partition_keys(hyper_config)
+                normalize_fipa_keys(hyper_config)
                 if 'ResNet' in model_name or 'GoogLeNet' in model_name or 'AlexNet' in model_name:
-                    # setdefault, NOT assignment: this block only normalises keys so
+                    # setdefault, NOT assignment: this block only normalizes keys so
                     # that fingerprints match across runs. A hard assignment here
                     # overrode whatever image_size the search space asked for,
                     # collapsing the axis to 224 and making the generated configs

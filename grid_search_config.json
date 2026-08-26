@@ -55,7 +55,8 @@
     ],
     "aggregation_algorithm": [
       "FedAvg",
-      "FedProx"
+      "FedProx",
+      "FIPA"
     ],
     "fedprox_mu": [
       0.05
@@ -68,29 +69,21 @@
     ],
     "partition_unit": [
       "track"
+    ],
+    "fipa_warmup_rounds": [
+      3
+    ],
+    "fipa_rank": [
+      5
+    ],
+    "fipa_grad_batches": [
+      64
+    ],
+    "fipa_pinv_rtol": [
+      1e-8
     ]
   },
   "model_specific_search_space": {
-    "GoogLeNet": {
-      "image_size": [
-        128,
-        224
-      ],
-      "num_custom_layers": [
-        2,
-        4
-      ]
-    },
-    "AlexNet": {
-      "image_size": [
-        128,
-        224
-      ],
-      "num_custom_layers": [
-        2,
-        4
-      ]
-    },
     "ConvNet": {
       "image_size": [
         128,
@@ -104,16 +97,6 @@
       ]
     },
     "ResNet18": {
-      "image_size": [
-        128,
-        224
-      ],
-      "num_custom_layers": [
-        2,
-        4
-      ]
-    },
-    "ResNet34": {
       "image_size": [
         128,
         224
