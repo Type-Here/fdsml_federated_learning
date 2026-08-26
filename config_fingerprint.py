@@ -23,6 +23,35 @@ from typing import Dict, FrozenSet, Set, Tuple
 PARTITION_ALPHA_SENTINEL = -1.0
 PARTITION_UNIT_SENTINEL = 'n/a'
 
+# Values written into the FIPA-only keys when the algorithm is not FIPA. Same
+# job as the two sentinels above, for the same reason: a parameter that means
+# something only under one setting must not create a distinct fingerprint for
+# every setting where it means nothing.
+#
+# `fipa_warmup_rounds` gets 0 and not -1, and the difference is not cosmetic.
+# These functions normalise the configuration that actually runs, not a copy of
+# it, and `ExtendedAggregator.warmup_rounds` is read on every round for every
+# algorithm - `aggregation_policy.effective_algorithm` raises on a negative
+# value. A -1 here would kill every non-FIPA run in the grid at its first round.
+# 0 is both legal and semantically right: nothing but FIPA warms up.
+FIPA_INACTIVE_VALUES = {
+    'fipa_warmup_rounds': 0,
+    'fipa_rank': -1,
+    'fipa_grad_batches': -1,
+    'fipa_pinv_rtol': -1.0,
+}
+
+# What the code falls back to when a FIPA run leaves a key undeclared. These
+# mirror the `config.get(key, default)` at each call site and must keep
+# mirroring them: the fingerprint has to describe the run that happened, not the
+# defaults we would prefer.
+FIPA_DEFAULTS = {
+    'fipa_warmup_rounds': 0,     # ExtendedAggregator.warmup_rounds
+    'fipa_rank': 5,              # FederatedClient._build_fipa_update
+    'fipa_grad_batches': None,   # FederatedClient._build_fipa_update
+    'fipa_pinv_rtol': 1e-8,      # fipa.DEFAULT_PINV_RTOL
+}
+
 # Keys that must count towards the fingerprint even when a configuration
 # declares them as fixed parameters rather than as search axes.
 EXTRA_FINGERPRINT_KEYS = (
@@ -32,6 +61,10 @@ EXTRA_FINGERPRINT_KEYS = (
     'dirichlet_alpha',
     'partition_unit',
     'max_units_per_class',
+    'fipa_warmup_rounds',
+    'fipa_rank',
+    'fipa_grad_batches',
+    'fipa_pinv_rtol',
 )
 
 
@@ -62,6 +95,35 @@ def normalize_partition_keys(entry: Dict) -> None:
     else:
         entry.setdefault('partition_unit', 'track')
         entry.setdefault('dirichlet_alpha', 0.5)
+
+
+def normalize_fipa_keys(entry: Dict) -> None:
+    """Make the FIPA keys comparable across runs, in place.
+
+    The FIPA dials describe an experiment only when FIPA is the algorithm.
+    Without this, a FedAvg run declaring `fipa_rank = 5` and one declaring
+    `fipa_rank = 20` would fingerprint differently and both would be queued,
+    even though they are the same experiment; and every row the lab already
+    produced, which has no FIPA columns at all, would look new and requeue the
+    entire previous grid.
+
+    As with `normalize_partition_keys`, this runs on both sides - the rows read
+    back from the results CSV and the configurations the grid generates - so the
+    two agree on the sentinel rather than on the absence of a key.
+
+    Note it also writes into the configuration that then runs, which is why
+    `FIPA_INACTIVE_VALUES` may only hold values that are harmless to a run that
+    never reads them (see the comment there about `fipa_warmup_rounds`).
+
+    Args:
+        entry: a generated configuration or a CSV row. Modified in place.
+    """
+    if entry.get('aggregation_algorithm') != 'FIPA':
+        entry.update(FIPA_INACTIVE_VALUES)
+        return
+
+    for key, default in FIPA_DEFAULTS.items():
+        entry.setdefault(key, default)
 
 
 def get_config_fingerprint(config: Dict, keys: Set[str]) -> FrozenSet[Tuple[str, str]]:
