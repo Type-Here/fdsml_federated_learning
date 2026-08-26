@@ -76,7 +76,9 @@ Contents:
     representation and the single vector the maths needs.
   - top_r_factors                       : client side. G -> (U_m, L_m).
   - explained_variance_ratio            : client side. Is r large enough?
-  - preconditioned_sum                  : server side. The core.
+  - consensus_curvature / project / expand : server side. The core, in three
+    steps, split where an encrypted variant would have to cut.
+  - preconditioned_sum                  : the three composed.
   - fipa_aggregate                      : the thin wrapper the aggregator calls.
 """
 
@@ -326,6 +328,264 @@ def explained_variance_ratio(G: np.ndarray, curvature: np.ndarray) -> float:
 #
 # SO:
 # result = (sum of info)+ * (sum of info * shift)
+#
+# The computation is split into three functions rather than written as one, and
+# the seam is deliberate: it is where an encrypted FIPA would have to cut.
+#
+#     consensus_curvature(clients)  -> (Q, V, sigma^+)   the pseudo-inverse of H
+#     project(clients, Q)           -> Q^T v,  in R^s    linear in the deltas
+#     expand(curvature, Q^T v)      -> increment in R^p  linear in Q^T v
+#
+# Under Paillier the server may do exactly two things: add ciphertexts, and
+# multiply a ciphertext by a *plaintext* scalar. Look at what each step needs:
+#
+#   - `consensus_curvature` is the only non-linear part of FIPA - a QR, an
+#     eigendecomposition, reciprocals - and it touches no model parameter at
+#     all. It is a function of U_m, L_m and N_m alone, which have to travel in
+#     the clear anyway because a QR of ciphertext does not exist. So the hard
+#     part is already on the allowed side.
+#   - `project` and `expand` are linear in the deltas with plaintext
+#     coefficients, which is precisely what Paillier permits.
+#
+# An encrypted variant therefore reuses `consensus_curvature` unchanged and
+# reimplements only the other two over ciphertexts. Nothing here does that
+# today - FIPA runs plaintext-only - but the split costs nothing and keeps the
+# door open. See `project`'s docstring for the one place where the plaintext
+# and encrypted routes take different paths to the same number.
+
+
+class ConsensusCurvature(NamedTuple):
+    """The round's curvature `H`, factored so that `H^+` can be applied.
+
+    `H = sum_m a_m H_m` is p x p and singular by construction, so it is neither
+    stored nor inverted. What is stored is the Rayleigh-Ritz factorisation:
+
+        H   = Q (V diag(sigma) V^T) Q^T
+        H^+ = Q (V diag(sigma^+) V^T) Q^T
+
+    Fields:
+        basis:            Q, shape (p, s), orthonormal columns spanning the
+                          union of every client's curvature directions.
+                          s = sum_m r_m <= M*r, i.e. 40 with 8 clients at r = 5.
+        rotation:         V, shape (s, s), the eigenvectors of the small matrix
+                          S = R R^T in that basis.
+        inverse_spectrum: sigma^+, shape (s,). The reciprocal of each
+                          eigenvalue, or exactly 0 for the directions cut by
+                          `rtol`.
+
+    Only `basis` is large. `rotation` and `inverse_spectrum` are s-sized, which
+    is why all the arithmetic between the projection and the expansion is free.
+    """
+
+    basis: np.ndarray
+    rotation: np.ndarray
+    inverse_spectrum: np.ndarray
+
+
+def sample_weights(clients: Sequence[ClientFactors]) -> List[float]:
+    """`a_m = N_m / N`, the share of the round's data each client holds.
+
+    Shared by `consensus_curvature` and `project` so that the two cannot drift:
+    they must weigh the clients identically, or `H^+` gets applied to a vector
+    that is not in the range of the `H` it was built from.
+
+    Returns zeros when no client has any data, so that a degenerate round
+    produces a zero update instead of a division by zero. `preconditioned_sum`
+    catches that case earlier and more explicitly; this is the second line of
+    defence for anyone calling the pieces directly.
+    """
+    total = sum(c.n_samples for c in clients)
+    if total <= 0:
+        return [0.0] * len(clients)
+    return [c.n_samples / total for c in clients]
+
+
+def _validate_clients(clients: Sequence[ClientFactors]) -> int:
+    """Check that every client speaks about the same parameter space.
+
+    Returns p, the shared dimension.
+
+    Raises:
+        ValueError: on an empty round, or on a client whose delta or directions
+            do not live in R^p. Failing here rather than letting numpy broadcast
+            something plausible is the point: a client that trained a different
+            model would otherwise contribute a silently meaningless update.
+    """
+    if not clients:
+        raise ValueError("no clients to aggregate")
+    p = clients[0].delta.size  # p = dimension of the parameter space
+    for m, c in enumerate(clients):
+        if c.delta.size != p:  # delta_m number should be 1 per parameter
+            raise ValueError(f"client {m} has delta of size {c.delta.size}, expected {p}")
+        if c.directions.shape[0] != p:
+            raise ValueError(f"client {m} has directions of shape {c.directions.shape}, expected first dim {p}")
+    return p
+
+
+def consensus_curvature(clients: Sequence[ClientFactors],
+                        rtol: float = DEFAULT_PINV_RTOL) -> ConsensusCurvature:
+    """Build `H^+` in factored form, from the curvatures alone.
+
+    This is steps 3 to 5 of the procedure: the part that needs no delta, no
+    parameter, nothing secret - only `directions`, `curvature` and `n_samples`.
+
+      3. The joint subspace. Stack every client's directions, each column
+         pre-scaled so that the stack squared *is* H:
+
+             C = [ U_1 * sqrt(a_1 * L_1) | ... | U_M * sqrt(a_M * L_M) ]
+
+         shape (p, s), s = sum_m r_m. Then H = C C^T exactly - legitimate
+         because a_m and L_m are non-negative, so the square roots are real.
+         L_m is clamped at 0 first: a randomized SVD can return a tiny negative
+         eigenvalue where the true one is 0, and `sqrt` of it is nan - one nan
+         poisons the whole update silently.
+
+      4. Down to s dimensions. A thin QR gives an orthonormal basis Q (p, s) of
+         the subspace containing every client's directions, and
+         H = Q (R R^T) Q^T. The small matrix S = R R^T is s x s - 40 x 40 with
+         8 clients at r = 5 - symmetric and positive semi-definite, so
+         `np.linalg.eigh` diagonalizes it exactly.
+
+         This is Rayleigh-Ritz: solve a huge problem inside a small subspace
+         known to contain the answer. Cost O(p*s^2) instead of O(p^3).
+
+      5. The pseudo-inverse. With S = V diag(sigma) V^T:
+
+             sigma^+_i = 1/sigma_i  if sigma_i > rtol * max(sigma), else 0
+
+         The cut is not optional. H is singular by construction, so its spectrum
+         always contains numerical noise around zero; inverting a 1e-18
+         eigenvalue turns a direction nobody has information about into a 1e18
+         amplification of round-off.
+
+    Args:
+        clients: the round's contributions. Only the curvature fields are read.
+        rtol: relative cut for the pseudo-inverse; see `DEFAULT_PINV_RTOL`.
+
+    Returns:
+        A `ConsensusCurvature`.
+
+    Raises:
+        ValueError: through `_validate_clients`.
+    """
+    _validate_clients(clients)
+
+    # 3.
+    blocks = []
+    for c, a_m in zip(clients, sample_weights(clients)):
+        directions = np.asarray(c.directions, dtype=np.float64)
+        curvature = np.maximum(np.asarray(c.curvature, dtype=np.float64), 0.0)
+        # factor of Curvature of client m: C_m @ C_m.T == a_m H_m == curvature
+        blocks.append(directions * np.sqrt(a_m * curvature))
+    # C = total info available C @ C^T
+    C = np.hstack(blocks)  # shape (p, s), s = sum_m r_m <= M*r
+
+    # 4.
+    Q, R = np.linalg.qr(C)
+    S = R @ R.T
+    sigma, V = np.linalg.eigh(S)
+
+    # 5.
+    # sigma^+_i = 1 / sigma_i if sigma_i > rtol * max(sigma), else 0
+    sigma_plus = np.zeros_like(sigma)
+    keep = sigma > rtol * max(sigma.max(), 0.0)  # sigma.max could be negative if rounded about 0
+    sigma_plus[keep] = 1.0 / sigma[keep]
+
+    return ConsensusCurvature(basis=Q, rotation=V, inverse_spectrum=sigma_plus)
+
+
+def project(clients: Sequence[ClientFactors], basis: np.ndarray) -> np.ndarray:
+    """`Q^T v`, the round's weighted information-times-shift, in R^s.
+
+    Step 2 of the procedure, followed immediately by the projection onto Q:
+
+        v = sum_m a_m H_m Delta_m = sum_m a_m U_m (L_m * (U_m^T Delta_m))
+
+    Read the inner expression right to left: project the delta onto the r
+    directions (r dot products), scale each by its curvature, recombine. Then
+    `Q^T v` drops from R^p to R^s, which loses nothing - `v` lies in the span of
+    Q by construction, since every term of the sum is a combination of columns
+    of some U_m and Q spans all of them.
+
+    Two routes to the same number, and the difference matters only under
+    encryption:
+
+        plaintext (here)   build v in R^p, then Q^T v.
+                           Cost ~ 2*p*r per client, plus p*s once.
+
+        encrypted (future) never build v. Per client, precompute the small
+                           plaintext matrix Q^T U_m (s, r), and accumulate
+                           Q^T v = sum_m (Q^T U_m) (a_m * L_m * z_m) where
+                           z_m = U_m^T Delta_m is the r-vector the client can
+                           compute itself, in the clear, and send encrypted.
+                           Cost ~ s*r*M ciphertext operations instead of p*r*M.
+
+    The plaintext route is chosen here because it is about an order of magnitude
+    cheaper *in plaintext*: forming Q^T U_m costs s*p*r per client, which is more
+    than building v outright. Under Paillier the ranking inverts, because what is
+    counted there is not flops but modular exponentiations on ciphertexts, and
+    the encrypted route needs s*r per client instead of p*r.
+
+    Args:
+        clients: the round's contributions. Assumed already validated - call
+            `consensus_curvature` (or `preconditioned_sum`) first.
+        basis: Q, from `ConsensusCurvature.basis`.
+
+    Returns:
+        Shape (s,).
+    """
+    p = clients[0].delta.size
+    # v = clients shifts, each weighted by how much info they have about that direction. Dimension: R^p
+    # v = sum_m a_m H_m Delta_m
+    v = np.zeros(p, dtype=np.float64)
+    for c, a_m in zip(clients, sample_weights(clients)):
+        # float64 at the door. These three arrive over the socket as whatever
+        # the client pickled, and with a frozen backbone that is float32
+        # (`get_weights` -> `.cpu().numpy()` on float32 tensors). The QR and the
+        # eigendecomposition are where single precision actually hurts: the
+        # pseudo-inverse amplifies exactly the small eigenvalues, so their
+        # relative error is what ends up in the update.
+        directions = np.asarray(c.directions, dtype=np.float64)
+        delta = np.asarray(c.delta, dtype=np.float64)
+        # Clamped the same way `consensus_curvature` clamps it: `v` and `C` must
+        # describe the same H, or the pseudo-inverse is applied to a vector that
+        # is not in its range.
+        curvature = np.maximum(np.asarray(c.curvature, dtype=np.float64), 0.0)
+
+        v += directions @ ((a_m * curvature) * (directions.T @ delta))
+
+    return basis.T @ v
+
+
+def expand(curvature: ConsensusCurvature, projected: np.ndarray) -> np.ndarray:
+    """Apply `H^+` to a vector already projected onto Q, and return to R^p.
+
+    Given `Q^T v` from `project`:
+
+        H^+ v = Q V diag(sigma^+) V^T (Q^T v)
+
+    Everything between the two Q's is s x s, so the only work proportional to p
+    is the final `Q @ ...`. That single step is also the only one an encrypted
+    variant cannot make cheap: it turns s ciphertexts into p ciphertexts, at
+    p*s scalar multiplications. Shrinking s - keeping fewer directions of the
+    *consensus* curvature, a stronger version of the `rtol` cut - is the dial
+    that would make an encrypted FIPA affordable.
+
+    Args:
+        curvature: from `consensus_curvature`.
+        projected: `Q^T v`, shape (s,).
+
+    Returns:
+        The increment, shape (p,).
+    """
+    Q, V, sigma_plus = curvature
+    return Q @ (V @ (sigma_plus * (V.T @ projected)))  # Pseudo-inverse of Moore-Penrose
+    # It simplifies H+ @ v which, in turn, simplifies a division v / H,
+    # which is the same as multiplying by the inverse of H.
+    # The pseudo-inverse is used because H is singular by construction,
+    # so directions nobody has information about get amplified by 1/epsilon.
+    # The result is the increment to be added to theta.
+
 
 def preconditioned_sum(clients: Sequence[ClientFactors],
                        rtol: float = DEFAULT_PINV_RTOL) -> np.ndarray:
@@ -338,43 +598,27 @@ def preconditioned_sum(clients: Sequence[ClientFactors],
         B_m   = a_m H^+ H_m
         result = sum_m B_m Delta_m  =  H^+ ( sum_m a_m H_m Delta_m )
 
-    The suggested procedure, five steps:
+    The procedure in five steps, and where each one lives now:
 
-      1. The weights.  a_m = N_m / sum_m N_m. If the total is 0 there is nothing
-         to aggregate - return a zero vector rather than dividing by zero.
+      1. The weights.  a_m = N_m / sum_m N_m.  -> `sample_weights`. If the total
+         is 0 there is nothing to aggregate - return a zero vector rather than
+         dividing by zero.
 
-      2. The right-hand side.  v = sum_m a_m * U_m @ (L_m * (U_m.T @ delta_m)).
-         Read the inner expression right to left: project the delta onto the r
-         directions (r dot products), scale each by its curvature, recombine.
-         `v` is the only vector of R^p built in this function besides the result.
+      2. The right-hand side.  v = sum_m a_m * U_m @ (L_m * (U_m.T @ delta_m)),
+         then down to R^s with Q^T v.  -> `project`.
 
-      3. The joint subspace.  Stack every client's directions, each column
-         pre-scaled so that the stack squared *is* H:
+      3. The joint subspace, C = [ U_m * sqrt(a_m * L_m) ]_m, and H = C C^T.
+      4. Down to s dimensions with a thin QR and an eigendecomposition of the
+         small S = R R^T.
+      5. The pseudo-inverse, sigma^+_i = 1/sigma_i above the `rtol` cut.
+         Steps 3 to 5 -> `consensus_curvature`.
 
-             C = [ U_1 * sqrt(a_1 * L_1) | ... | U_M * sqrt(a_M * L_M) ]
+      6. Back up to R^p.  -> `expand`.
 
-         with shape (p, s), s = sum_m r_m <= M*r. Then H = C C^T exactly -
-         legitimate because a_m and L_m are non-negative, so the square roots
-         are real. Clamp L_m at 0 first: a randomized SVD can return a tiny
-         negative eigenvalue where the true one is 0.
-
-      4. Down to s dimensions.  A thin QR, `Q, R = np.linalg.qr(C)`, gives an
-         orthonormal basis Q (p, s) of the subspace containing all the clients'
-         directions, and H = Q (R R^T) Q^T. Eigendecompose the *small* matrix
-         S = R R^T with `np.linalg.eigh` - it is s x s, i.e. 40 x 40 with 8
-         clients at r = 5, and symmetric PSD.
-
-         This is Rayleigh-Ritz: solve a huge problem inside a small subspace
-         known to contain the answer. Cost O(p*r) instead of O(p^2).
-
-      5. The pseudo-inverse, and back up.  With S = V diag(sigma) V^T:
-
-             H^+ = Q V diag(sigma^+) V^T Q^T
-             sigma^+_i = 1/sigma_i  if sigma_i > rtol * max(sigma), else 0
-
-         Apply it to `v`: project with `Q.T @ v`, do the small work in R^s,
-         then map back with `Q @ ...`. Note `v` lies in the span of Q by
-         construction, so nothing is lost by going through Q.
+    This function is only the composition. The three pieces are separate
+    because the encrypted variant would keep step 3-5 verbatim (they read no
+    parameters) and reimplement 2 and 6 over ciphertexts; see the comment block
+    above `ConsensusCurvature`.
 
     What breaks if done naively:
       - forming H_m or H explicitly: 81 GB per client;
@@ -402,67 +646,12 @@ def preconditioned_sum(clients: Sequence[ClientFactors],
     Raises:
         ValueError: on an empty `clients`, or on mismatched p between clients.
     """
-    if not clients:
-        raise ValueError("no clients to aggregate")
-    p = clients[0].delta.size # p = dimension of the parameter space
-    for m, c in enumerate(clients):
-        if c.delta.size != p: # delta_m number should be 1 per parameter
-            raise ValueError(f"client {m} has delta of size {c.delta.size}, expected {p}")
-        if c.directions.shape[0] != p:
-            raise ValueError(f"client {m} has directions of shape {c.directions.shape}, expected first dim {p}")
-    N = sum(c.n_samples for c in clients)
-    if N == 0:
+    p = _validate_clients(clients)
+    if sum(c.n_samples for c in clients) == 0:
         return np.zeros(p, dtype=np.float64)
-    # 1.
-    weights = [c.n_samples / N for c in clients]
 
-    # 2.
-    # v = clients shifts, each weighted by how much info they have about that direction. Dimension: R^p
-    # v = sum_m a_m H_m Delta_m
-    v = np.zeros(p, dtype=np.float64)
-    blocks = []
-    for c, a_m in zip(clients, weights):
-
-        # float64 at the door. These three arrive over the socket as whatever
-        # the client pickled, and with a frozen backbone that is float32
-        # (`get_weights` -> `.cpu().numpy()` on float32 tensors). The QR and the
-        # eigendecomposition below are where single precision actually hurts:
-        # the pseudo-inverse amplifies exactly the small eigenvalues, so their
-        # relative error is what ends up in the update.
-        directions = np.asarray(c.directions, dtype=np.float64)
-        delta = np.asarray(c.delta, dtype=np.float64)
-        # Clamped once, here, and used by both step 2 and step 3: a randomized
-        # SVD can return a tiny negative eigenvalue where the true one is 0, and
-        # `v` and `C` must describe the same H or the pseudo-inverse is applied
-        # to a vector that is not in its range.
-        curvature = np.maximum(np.asarray(c.curvature, dtype=np.float64), 0.0)
-
-        v += directions @ ((a_m * curvature) * (directions.T @ delta))
-    # 3.
-        # factor of Curvature of client m: C_m @ C_m.T == a_m H_m == curvature
-        C_m = directions * np.sqrt(a_m * curvature)
-        blocks.append(C_m)
-    # C = total info available C @ C^T
-    C = np.hstack(blocks)  # shape (p, s), s = sum_m r_m <= M*r
-
-    # 4.
-    Q, R = np.linalg.qr(C)
-    S = R @ R.T
-    sigma, V = np.linalg.eigh(S)
-
-    # 5.
-    #sigma ^ +_i = 1 / sigma_i if sigma_i > rtol * max(sigma), else 0
-    sigma_plus = np.zeros_like(sigma)
-    keep = sigma > rtol * max(sigma.max(), 0.0) # sigma.max could be negative if rounded about 0
-    sigma_plus[keep] = 1.0 / sigma[keep]
-
-    return Q @ (V @ (sigma_plus * (V.T @ (Q.T @ v)))) # Pseudo-inverse of Moore-Penrose
-
-    # It simplifies H+ @ v which, in turn, simplifies a division v / H,
-    # which is the same as multiplying by the inverse of H.
-    # The pseudo-inverse is used because H is singular by construction,
-    # so directions nobody has information about get amplified by 1/epsilon.
-    # The result is the increment to be added to theta.
+    curvature = consensus_curvature(clients, rtol)
+    return expand(curvature, project(clients, curvature.basis))
 
 # ---------------------------------------------------------------------------
 # The wrapper the aggregator calls
