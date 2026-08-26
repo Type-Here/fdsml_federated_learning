@@ -12,86 +12,6 @@
       "name": "gtsrb",
       "path": "dataset/gtsrb/train",
       "num_classes": 43
-    },
-    {
-      "name": "dataset_slices_sorted",
-      "path": "dataset/dataset_slices_sorted",
-      "num_classes": 2
-    },
-    {
-      "name": "dataset_slices_sorted_augmented",
-      "path": "dataset/dataset_slices_sorted_augmented",
-      "num_classes": 2
-    },
-    {
-      "name": "dataset_slices_sorted_T2",
-      "path": "dataset/dataset_slices_sorted_T2",
-      "num_classes": 2
-    },
-    {
-      "name": "dataset_slices_sorted_T2_augmented",
-      "path": "dataset/dataset_slices_sorted_T2_augmented",
-      "num_classes": 2
-    },
-    {
-      "name": "dataset_slices_sorted_T1",
-      "path": "dataset/dataset_slices_sorted_T1",
-      "num_classes": 2
-    },
-    {
-      "name": "dataset_slices_sorted_T1_augmented",
-      "path": "dataset/dataset_slices_sorted_T1_augmented",
-      "num_classes": 2
-    },
-    {
-      "name": "dataset_slices_sorted_Flair_augmented",
-      "path": "dataset/dataset_slices_sorted_Flair_augmented",
-      "num_classes": 2
-    },
-    {
-      "name": "dataset_slices_sorted_Flair",
-      "path": "dataset/dataset_slices_sorted_Flair",
-      "num_classes": 2
-    },
-    {
-      "name": "dataset_multy_sorted",
-      "path": "dataset/dataset_multy_sorted",
-      "num_classes": 3
-    },
-    {
-      "name": "dataset_multy_sorted_augmented",
-      "path": "dataset/dataset_multy_sorted_augmented",
-      "num_classes": 3
-    },
-    {
-      "name": "dataset_multy_sorted_T2",
-      "path": "dataset/dataset_multy_sorted_T2",
-      "num_classes": 3
-    },
-    {
-      "name": "dataset_multy_sorted_T2_augmented",
-      "path": "dataset/dataset_multy_sorted_T2_augmented",
-      "num_classes": 3
-    },
-    {
-      "name": "dataset_multy_sorted_T1",
-      "path": "dataset/dataset_multy_sorted_T1",
-      "num_classes": 3
-    },
-    {
-      "name": "dataset_multy_sorted_T1_augmented",
-      "path": "dataset/dataset_multy_sorted_T1_augmented",
-      "num_classes": 3
-    },
-    {
-      "name": "dataset_multy_sorted_Flair_augmented",
-      "path": "dataset/dataset_multy_sorted_Flair_augmented",
-      "num_classes": 3
-    },
-    {
-      "name": "dataset_multy_sorted_Flair",
-      "path": "dataset/dataset_multy_sorted_Flair",
-      "num_classes": 3
     }
   ],
   "common_search_space": {
@@ -120,9 +40,7 @@
     "num_clients": [
       2,
       4,
-      8,
-      16,
-      32
+      8
     ],
     "models_percentage": [
       1
@@ -196,26 +114,6 @@
       ]
     },
     "ResNet34": {
-      "image_size": [
-        128,
-        224
-      ],
-      "num_custom_layers": [
-        2,
-        4
-      ]
-    },
-    "ResNet50": {
-      "image_size": [
-        128,
-        224
-      ],
-      "num_custom_layers": [
-        2,
-        4
-      ]
-    },
-    "ResNet101": {
       "image_size": [
         128,
         224
