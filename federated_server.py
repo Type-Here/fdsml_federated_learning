@@ -168,11 +168,14 @@ class FederatedServer:
             'round_number': self.current_round,
             'current_weights': current_weights_pickled,
             'total_training_size': self.total_training_size_in_round,
-            # What the client must divide the payload by. FedAvg-style rules
-            # send N (the server summed, the client averages); rules whose
-            # server output is already the finished model send 1.0.
-            'aggregation_denominator': self.aggregator.client_denominator(
-                self.total_training_size_in_round
+            # Two keys about two different rounds: which rule governs the round
+            # about to run (it can change mid-run, FIPA warms up as FedAvg), and
+            # what the client must divide this payload by - which describes what
+            # the *previous* aggregation left in `current_weights`. The
+            # aggregator owns both, and snapshots the parameters it is
+            # broadcasting for the rules that need them.
+            **self.aggregator.begin_round(
+                self.current_round, self.total_training_size_in_round
             ),
         }
 
@@ -210,15 +213,20 @@ class FederatedServer:
         # here rather than once at startup so the mapping is always current.
         self.aggregator.register_client_stats(self.client_stats)
 
+        # The *effective* algorithm, not the configured one: a rule that warms
+        # up spends its first rounds as plain FedAvg, and the clients were told
+        # so in the round payload. If the two ever disagreed by one round, the
+        # server would aggregate deltas as if they were parameters.
+        algorithm = self.aggregator.effective_algorithm(self.current_round)
+
         if self.encryption_mode == 'no_encryption':
-            self.logger.info("Aggregating plaintext updates.")
-            self.aggregator.aggregate_weights(
-                self.client_updates_this_round,
-                self.config['aggregation_algorithm']
-            )
+            self.logger.info("Aggregating plaintext updates with '%s'.", algorithm)
+            self.aggregator.aggregate_weights(self.client_updates_this_round, algorithm)
         else:  # Encrypted modes
-            self.logger.info("Aggregating encrypted updates.")
-            self.aggregator.aggregate_encrypted_updates(self.client_updates_this_round)
+            self.logger.info("Aggregating encrypted updates with '%s'.", algorithm)
+            self.aggregator.aggregate_encrypted_updates(
+                self.client_updates_this_round, algorithm
+            )
 
         if self.config.get('weighted_aggregation', True):
             self.aggregator.aggregate_train_loss_weighted(train_losses, train_sizes, self.current_round)
