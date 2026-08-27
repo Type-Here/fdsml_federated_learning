@@ -11,6 +11,7 @@ from model_manager import ModelManager
 from utils import object_to_pickle_string, pickle_string_to_object, encrypt_weights, decrypt_weights
 
 import fipa
+import fipa_encrypted
 from model_manager_ext import ExtendedModelManager
 
 
@@ -40,21 +41,6 @@ class FederatedClient:
         self.logger: logging.LoggerAdapter = self._setup_logger()
 
         self.encryption_mode: str = self.config.get('encryption_mode', 'none')
-
-        # Fail here rather than eight rounds in. FIPA's encrypted variant 
-        # not implemented yet: the server would raise
-        # on the first refinement round, after a full warmup has already been
-        # paid for. The warmup itself would run fine, which is exactly what
-        # makes the late failure confusing.
-        if (self.config.get('aggregation_algorithm') == 'FIPA'
-                and self.encryption_mode != 'no_encryption'):
-            self.logger.error(
-                "FIPA is only implemented on the plaintext path, but "
-                "encryption_mode is '%s'. Set encryption_mode to "
-                "'no_encryption' for FIPA runs.", self.encryption_mode)
-            raise ValueError(
-                f"FIPA does not support encryption_mode='{self.encryption_mode}'."
-            )
 
         if self.encryption_mode != 'no_encryption':
             self.logger.info("Encryption enabled. Keys will be requested from the Trusted Authority.")
@@ -281,15 +267,10 @@ class FederatedClient:
                         self.config.get("aggregation_algorithm", "FedAvg"))
 
     def _build_fipa_update(self, global_weights, local_weights, data: Dict) -> Dict:
-        """The extra payload of a FIPA round: the delta and the curvature.
+        """The payload of a FIPA round: the movement and the curvature.
 
-        Returns the keys to merge into the `client_update` message:
+        Common to both routes:
 
-            weights      Delta_m = theta_m - theta_global, in the same
-                         list-of-arrays shape as ordinary weights, so the wire
-                         format does not change type between rounds.
-            payload_kind 'delta', so the server can refuse to aggregate deltas
-                         as if they were absolute parameters.
             fipa_U       U_m, the top-r curvature directions, (p, r) float32.
             fipa_lambda  L_m, the matching eigenvalues, (r,) float32.
             fipa_explained_variance
@@ -298,15 +279,39 @@ class FederatedClient:
                          result: it is what tells us whether `fipa_rank` is big
                          enough on this model and this data.
 
+        And then the client's movement, in the only form the route allows:
+
+            plaintext    weights      Delta_m = theta_m - theta_global, in the
+                                      same list-of-arrays shape as ordinary
+                                      weights, so the wire format does not
+                                      change type between rounds.
+                         payload_kind 'delta'.
+
+            encrypted    fipa_z       Enc(U_m^T Delta_m), **r ciphertexts**, at
+                                      the fixed exponent `fipa_encrypted`
+                                      pins both sides of the server's
+                                      multiplication to.
+                         payload_kind 'fipa_z'.
+                         weights      an empty list - the server unpickles that
+                                      key unconditionally
+                                      (`federated_server._on_client_update`),
+                                      and there is no delta to put in it.
+
+        **Encrypted FIPA encrypts (by default) 5 numbers where encrypted FedAvg encrypts
+        142379.** That is not a saving taken at the cost of accuracy: in
+        `B_m Delta_m = a_m H^+ U_m diag(L_m) (U_m^T Delta_m)` every occurrence of
+        the delta sits behind `U_m^T`, so the part left at home is the part the
+        server would multiply by zero. See `fipa.project_delta`.
+
         Why the client computes the delta and not the server: the server could
-        subtract, since it knows what it broadcast, but only in plaintext. Doing
-        it here keeps the door open for an encrypted FIPA, where the server
-        cannot form `-theta_global` at all (it holds no public key). The
-        subtraction is free anyway - both vectors are already in this method.
+        subtract, since it knows what it broadcast - but only in plaintext.
+        Under encryption it holds ciphertexts and no public key, so it cannot
+        form `-theta_global` at all. The subtraction is free here anyway, both
+        vectors are already in this method.
         """
         global_flat, _ = fipa.flatten_weights(global_weights)
         local_flat, shapes = fipa.flatten_weights(local_weights)
-        delta = fipa.unflatten_weights(local_flat - global_flat, shapes)
+        delta_flat = local_flat - global_flat
 
         directions, curvature, explained = self.local_model.collect_gradient_factors(
             batch_size=data['batch_size'],
@@ -315,13 +320,26 @@ class FederatedClient:
             random_state=int(self.config.get('seed', 42)),
             logger=self.logger,
         )
-        return {
-            'weights': object_to_pickle_string(delta),
-            'payload_kind': 'delta',
+        payload = {
             'fipa_U': object_to_pickle_string(directions),
             'fipa_lambda': object_to_pickle_string(curvature),
             'fipa_explained_variance': explained,
         }
+
+        if self.encryption_mode == 'no_encryption':
+            payload['weights'] = object_to_pickle_string(
+                fipa.unflatten_weights(delta_flat, shapes))
+            payload['payload_kind'] = 'delta'
+            return payload
+        # Else encrypted:
+        projection = fipa.project_delta(directions, delta_flat)
+        self.logger.info("Encrypting the %d-value curvature projection instead "
+                         "of the %d-parameter delta.", projection.size, delta_flat.size)
+        payload['fipa_z'] = object_to_pickle_string(
+            fipa_encrypted.encrypt_projection(self.paillier_pubkey, projection))
+        payload['payload_kind'] = 'fipa_z'
+        payload['weights'] = object_to_pickle_string([])
+        return payload
 
     def _update_worker(self, data: Dict):
         try:
@@ -341,12 +359,6 @@ class FederatedClient:
             )
             local_weights = self.local_model.get_weights()
 
-            if self.encryption_mode != 'no_encryption':
-                weights_to_send = encrypt_weights(self.paillier_pubkey, local_weights,
-                                                  encryption_mode=self.encryption_mode, logger=self.logger)
-            else:
-                weights_to_send = local_weights
-
             response = {
                 'client_id': self.client_id,
                 'round_number': data['round_number'], 'train_loss': train_loss,
@@ -354,17 +366,29 @@ class FederatedClient:
                 train_map['f1_score'],
                 'avg_acc': np.mean(list(train_map['accuracy'])) if isinstance(train_map['accuracy'], list) else
                 train_map['accuracy'],
-                'train_size': train_size, 'weights': object_to_pickle_string(weights_to_send),
-                'payload_kind': 'weights',
+                'train_size': train_size,
             }
 
-            # A FIPA round replaces the absolute weights with the delta and adds
-            # the curvature factors. Done after `response` is built, so a warmup
-            # round is byte for byte what it was before this feature existed.
+            # A FIPA round replaces the absolute weights with the client's
+            # movement and adds the curvature factors. The branch comes *before*
+            # any encryption, and that ordering is the point: an encrypted FIPA
+            # round encrypts the r-value projection, so encrypting the whole
+            # parameter vector first would pay for 142379 Paillier encryptions
+            # and then throw them away. A warmup round takes the other branch
+            # and is byte for byte what it was before this feature existed.
             if algorithm == 'FIPA':
                 self.logger.info("Round %s is a FIPA refinement round: collecting "
                                  "curvature factors.", data['round_number'])
                 response.update(self._build_fipa_update(averaged_weights, local_weights, data))
+            else:
+                if self.encryption_mode != 'no_encryption':
+                    weights_to_send = encrypt_weights(self.paillier_pubkey, local_weights,
+                                                      encryption_mode=self.encryption_mode, logger=self.logger)
+                else:
+                    weights_to_send = local_weights
+                response['weights'] = object_to_pickle_string(weights_to_send)
+                response['payload_kind'] = 'weights'
+
             self.logger.info("Worker thread: Sending client update for round %s.", data['round_number'])
             self.sio.emit('client_update', response)
             self.logger.info("--- Worker thread Round %s Training Summary ---", data['round_number'])
