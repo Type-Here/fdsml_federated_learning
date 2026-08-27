@@ -76,13 +76,21 @@ Contents:
     representation and the single vector the maths needs.
   - top_r_factors                       : client side. G -> (U_m, L_m).
   - explained_variance_ratio            : client side. Is r large enough?
+  - project_delta                       : client side. Delta_m -> z_m, the r
+    numbers the encrypted route sends instead of the whole delta.
   - consensus_curvature / project / expand : server side. The core, in three
-    steps, split where an encrypted variant would have to cut.
-  - preconditioned_sum                  : the three composed.
+    steps, split where the encrypted route cuts.
+  - preconditioned_sum                  : the three composed. Plaintext route.
+  - preconditioners                     : the same three fused into one matrix
+    P_m per client, so the encrypted route multiplies each ciphertext once.
   - fipa_aggregate                      : the thin wrapper the aggregator calls.
+
+The Paillier side of the encrypted route - the fixed-point discipline and the
+homomorphic loop - is in `fipa_encrypted.py`, which is the only module here that
+imports `phe`.
 """
 
-from typing import List, NamedTuple, Sequence, Tuple
+from typing import Iterator, List, NamedTuple, Optional, Sequence, Tuple
 import sklearn.utils.extmath
 import numpy as np
 
@@ -105,7 +113,15 @@ class ClientFactors(NamedTuple):
     round's updates is `aggregator_ext.py`'s job.
 
     Fields:
-        delta:      Delta_m = theta_m - theta_global, shape (p,).
+        delta:      Delta_m = theta_m - theta_global, shape (p,). **May be
+                    None**, and is on the encrypted route: there the client
+                    keeps Delta_m to itself and sends only its projection
+                    `z_m = U_m^T Delta_m`, encrypted, so the server never holds
+                    the delta in any form it could put in this field. Everything
+                    that reads `delta` (`project`, `preconditioned_sum`) is the
+                    plaintext route; everything that reads only the curvature
+                    (`sample_weights`, `consensus_curvature`, `preconditioners`)
+                    works either way.
         directions: U_m, the top-r curvature directions, shape (p, r),
                     orthonormal columns.
         curvature:  L_m, the matching eigenvalues, shape (r,), non-negative and
@@ -113,7 +129,7 @@ class ClientFactors(NamedTuple):
         n_samples:  N_m, client m's `train_size`.
     """
 
-    delta: np.ndarray
+    delta: Optional[np.ndarray]
     directions: np.ndarray
     curvature: np.ndarray
     n_samples: float
@@ -347,11 +363,12 @@ def explained_variance_ratio(G: np.ndarray, curvature: np.ndarray) -> float:
 #   - `project` and `expand` are linear in the deltas with plaintext
 #     coefficients, which is precisely what Paillier permits.
 #
-# An encrypted variant therefore reuses `consensus_curvature` unchanged and
-# reimplements only the other two over ciphertexts. Nothing here does that
-# today - FIPA runs plaintext-only - but the split costs nothing and keeps the
-# door open. See `project`'s docstring for the one place where the plaintext
-# and encrypted routes take different paths to the same number.
+# The encrypted route therefore reuses `consensus_curvature` verbatim and
+# replaces the other two with `preconditioners`, which fuses them into one
+# plaintext matrix per client so that each ciphertext is multiplied exactly
+# once. See `project`'s docstring for the two paths to the same number, and
+# `preconditioners` for why fusing is not an optimisation but a correctness
+# requirement under Paillier.
 
 
 class ConsensusCurvature(NamedTuple):
@@ -403,7 +420,10 @@ def sample_weights(clients: Sequence[ClientFactors]) -> List[float]:
 def _validate_clients(clients: Sequence[ClientFactors]) -> int:
     """Check that every client speaks about the same parameter space.
 
-    Returns p, the shared dimension.
+    Returns p, the shared dimension. It is read off the directions, which every
+    route has, rather than off the delta, which the encrypted route does not:
+    there the server holds `Enc(z_m)` - r ciphertexts - and never sees a delta at
+    all, so `delta=None` is a legitimate record and not a missing field.
 
     Raises:
         ValueError: on an empty round, or on a client whose delta or directions
@@ -413,12 +433,12 @@ def _validate_clients(clients: Sequence[ClientFactors]) -> int:
     """
     if not clients:
         raise ValueError("no clients to aggregate")
-    p = clients[0].delta.size  # p = dimension of the parameter space
+    p = clients[0].directions.shape[0]  # p = dimension of the parameter space
     for m, c in enumerate(clients):
-        if c.delta.size != p:  # delta_m number should be 1 per parameter
-            raise ValueError(f"client {m} has delta of size {c.delta.size}, expected {p}")
         if c.directions.shape[0] != p:
             raise ValueError(f"client {m} has directions of shape {c.directions.shape}, expected first dim {p}")
+        if c.delta is not None and c.delta.size != p:  # delta_m: one number per parameter
+            raise ValueError(f"client {m} has delta of size {c.delta.size}, expected {p}")
     return p
 
 
@@ -533,7 +553,19 @@ def project(clients: Sequence[ClientFactors], basis: np.ndarray) -> np.ndarray:
 
     Returns:
         Shape (s,).
+
+    Raises:
+        ValueError: if any client carries no delta. That is the encrypted
+            route's record shape, and the encrypted route does not come through
+            here - it goes through `preconditioners` instead, because the server
+            holds `Enc(z_m)` and cannot form `v` in R^p at all.
     """
+    if any(c.delta is None for c in clients):
+        raise ValueError(
+            "project needs every client's delta, but at least one is None. "
+            "Records without a delta come from the encrypted route; use "
+            "preconditioners() there."
+        )
     p = clients[0].delta.size
     # v = clients shifts, each weighted by how much info they have about that direction. Dimension: R^p
     # v = sum_m a_m H_m Delta_m
@@ -555,6 +587,103 @@ def project(clients: Sequence[ClientFactors], basis: np.ndarray) -> np.ndarray:
         v += directions @ ((a_m * curvature) * (directions.T @ delta))
 
     return basis.T @ v
+
+
+def project_delta(directions: np.ndarray, delta: np.ndarray) -> np.ndarray:
+    """`z_m = U_m^T Delta_m`: how far the client moved, in its own r directions.
+
+    Client side, and the whole reason the encrypted route is affordable. What
+    the FIPA update does with `Delta_m` is, written out:
+
+        B_m Delta_m = a_m H^+ U_m diag(L_m) (U_m^T Delta_m)
+                                             \____ z_m ____/
+
+    Every appearance of `Delta_m` is behind `U_m^T`. The component of the delta
+    orthogonal to the client's own curvature directions is multiplied by zero
+    and thrown away, whatever the other clients sent. So sending the whole delta
+    is sending p - r numbers that the algorithm is about to discard: with
+    p = 142379 and r = 5, 142374 of them.
+
+    This is not an approximation and not a privacy/accuracy trade: the encrypted
+    result equals the plaintext one exactly (up to the fixed-point grid of
+    `fipa_encrypted`), because what is left out is what the maths cancels.
+
+    Args:
+        directions: U_m, shape (p, r), orthonormal columns.
+        delta: Delta_m, shape (p,), or any shape with p entries.
+
+    Returns:
+        `z_m`, shape (r,), float64. r numbers - which is what the client
+        encrypts, instead of p.
+    """
+    directions = np.asarray(directions, dtype=np.float64)
+    delta = np.asarray(delta, dtype=np.float64).ravel()
+    if delta.size != directions.shape[0]:
+        raise ValueError(
+            f"delta has {delta.size} values but the directions live in "
+            f"R^{directions.shape[0]}"
+        )
+    return directions.T @ delta
+
+
+def preconditioners(clients: Sequence[ClientFactors],
+                    rtol: float = DEFAULT_PINV_RTOL) -> Iterator[np.ndarray]:
+    """Yield `P_m`, the one plaintext matrix that turns `z_m` into an increment.
+
+    The server-side counterpart of `project_delta`, and the reason encrypted
+    FIPA needs exactly **one** multiplication level on a ciphertext.
+
+        increment = sum_m B_m Delta_m = sum_m P_m z_m
+
+        P_m = Q ( V diag(sigma^+) V^T ( (Q^T U_m) * (a_m L_m) ) )     shape (p, r)
+              \________________ all (s, s) and (s, r) __________/
+
+    Written the natural way the server would do three things in a row to the
+    same ciphertext - project onto Q, apply H^+, come back up to R^p - and under
+    Paillier each of those multiplies the encoding by the encoding of a float,
+    so the third one lands past the representable ceiling and decrypts to a
+    plausible wrong number instead of raising. Fusing them costs nothing,
+    because everything between the two Q's is s x s (40 x 40 with 8 clients at
+    r = 5) and is computed in numpy before a ciphertext is touched.
+
+    Read the expression right to left: take the client's directions expressed in
+    the joint basis, weigh them by that client's share of the round's data times
+    its own curvature, run them through the pseudo-inverse of the consensus
+    curvature, come back up to R^p.
+
+    Symbols, all defined in the module docstring: `Q` the orthonormal basis of
+    the joint subspace (p, s), `V` and `sigma^+` the eigenvectors and inverted
+    eigenvalues of the small matrix inside it, `a_m = N_m / N`, `L_m` client m's
+    eigenvalues, `U_m` its directions.
+
+    A generator rather than a list on purpose: `P_m` is (142379, 5) in float64,
+    5.7 MB, and the caller consumes one client at a time before building the
+    next - so the round's peak memory is one matrix, not M of them.
+
+    Only the curvature fields are read, so this works on records whose `delta`
+    is None - which is exactly the encrypted route's record.
+
+    Args:
+        clients: the round's contributions, in the order the caller will pair
+            them with the clients' `z_m`. **The order matters**: `P_m` and `z_m`
+            must come from the same client.
+        rtol: relative cut for the pseudo-inverse; see `DEFAULT_PINV_RTOL`.
+
+    Yields:
+        `P_m` of shape (p, r_m), one per client, in the order given.
+    """
+    curvature = consensus_curvature(clients, rtol)
+    Q, V, sigma_plus = curvature
+
+    for c, a_m in zip(clients, sample_weights(clients)):
+        directions = np.asarray(c.directions, dtype=np.float64)
+        # Clamped the same way `consensus_curvature` clamps it, or the operator
+        # and the H it is inverted against would describe different matrices.
+        eigenvalues = np.maximum(np.asarray(c.curvature, dtype=np.float64), 0.0)
+
+        small = (Q.T @ directions) * (a_m * eigenvalues)          # (s, r)
+        small = V @ (sigma_plus[:, None] * (V.T @ small))         # (s, r)
+        yield Q @ small                                           # (p, r)
 
 
 def expand(curvature: ConsensusCurvature, projected: np.ndarray) -> np.ndarray:
