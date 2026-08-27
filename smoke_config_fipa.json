@@ -1,0 +1,84 @@
+{
+  "ip_address": "127.0.0.1",
+  "port": 5201,
+  "base_csv_path": "csv_smoke_fipa",
+  "base_log_path": "logs_smoke_fipa",
+  "base_plot_path": "static/plots_smoke_fipa",
+  "base_split_data_path": "run_dataset_smoke_fipa",
+  "early_stop_patience": 5,
+  "weighted_aggregation": true,
+  "num_parallel_executions": 1,
+  "seed": 42,
+  "max_units_per_class": 2,
+  "datasets": [
+    {
+      "name": "gtsrb_smoke_fipa",
+      "path": "dataset/gtsrb/train",
+      "num_classes": 43
+    }
+  ],
+  "common_search_space": {
+    "encryption_mode": [
+      "no_encryption",
+      "direct_encrypted_update"
+    ],
+    "device": [
+      "cuda"
+    ],
+    "global_epoch": [
+      3
+    ],
+    "local_epoch": [
+      1
+    ],
+    "num_clients": [
+      4
+    ],
+    "models_percentage": [
+      1
+    ],
+    "learning_rate": [
+      0.001
+    ],
+    "batch_size": [
+      16
+    ],
+    "aggregation_algorithm": [
+      "FIPA"
+    ],
+    "fedprox_mu": [
+      0.0
+    ],
+    "partition_strategy": [
+      "dirichlet"
+    ],
+    "dirichlet_alpha": [
+      0.5
+    ],
+    "partition_unit": [
+      "track"
+    ],
+    "fipa_warmup_rounds": [
+      1
+    ],
+    "fipa_rank": [
+      5
+    ],
+    "fipa_grad_batches": [
+      64
+    ],
+    "fipa_pinv_rtol": [
+      1e-8
+    ]
+  },
+  "model_specific_search_space": {
+    "ResNet18": {
+      "image_size": [
+        128
+      ],
+      "num_custom_layers": [
+        1
+      ]
+    }
+  }
+}
