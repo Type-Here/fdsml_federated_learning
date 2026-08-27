@@ -125,11 +125,46 @@ def test_begin_round_announces_the_effective_algorithm():
     assert aggregator.begin_round(2, 100)["aggregation_algorithm"] == "FIPA"
 
 
-def test_fipa_under_encryption_fails_at_construction():
-    # The QR and the eigendecomposition FIPA needs have no Paillier equivalent.
-    # Failing here rather than at the first refinement round is the point.
-    with pytest.raises(ValueError, match="no_encryption"):
-        make_aggregator(encryption_mode="direct_encrypted_update")
+def test_fipa_under_encryption_is_accepted():
+    """FIPA no longer refuses encryption at construction.
+
+    The QR and the eigendecomposition it needs have no Paillier equivalent, but
+    they never touch a model parameter: they run on `U_m` and `L_m`, which have
+    to travel in the clear anyway. What crosses the encrypted barrier is only
+    `z_m = U_m^T Delta_m`, r numbers, and one multiplication by a plaintext
+    matrix - both of which Paillier allows.
+    """
+    aggregator = make_aggregator(encryption_mode="direct_encrypted_update")
+    assert aggregator.encryption_mode == "direct_encrypted_update"
+
+
+def test_no_snapshot_is_taken_on_the_encrypted_path():
+    """`current_weights` holds ciphertext dicts there, and they cannot be divided.
+
+    The encrypted branch does not want a snapshot either: it never subtracts
+    theta from anything, it adds its increment straight onto the ciphertexts.
+    """
+    aggregator = make_aggregator(fipa_warmup_rounds=0,
+                                 encryption_mode="direct_encrypted_update")
+    aggregator.begin_round(0, 0)
+    assert aggregator.global_weights is None
+
+
+def test_begin_round_remembers_the_denominator_it_announced():
+    """The encrypted branch cannot recompute it later.
+
+    By the time the aggregation runs, the server's `total_training_size_in_round`
+    already holds *this* round's total, while the payload the clients trained
+    from was scaled by the previous round's.
+    """
+    aggregator = make_aggregator(fipa_warmup_rounds=2,
+                                 encryption_mode="direct_encrypted_update")
+    aggregator.last_aggregation_algorithm = "FedAvg"
+
+    payload = aggregator.begin_round(2, 100)
+
+    assert payload["aggregation_denominator"] == 100.0
+    assert aggregator.last_broadcast_denominator == 100.0
 
 
 # ---------------------------------------------------------------------------
