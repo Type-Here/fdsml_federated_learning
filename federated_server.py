@@ -238,7 +238,15 @@ class FederatedServer:
         # self.logger.info("Shutting down the server.")
         ta_address = f"http://{self.config['ip_address']}:{self.config['ta_port']}"
         emit('shutdown', {'ta_address': ta_address})
-        time.sleep(1)
+        # socketio.sleep, not time.sleep. The server runs on eventlet without
+        # monkey patching, so every connection is a green thread on one OS
+        # thread: the real time.sleep blocks the whole hub, the queued
+        # 'shutdown' packets are never written to the sockets, and stop() below
+        # then tears the server down before any client hears about it. The
+        # clients see a bare connection drop instead and, having reconnection
+        # enabled, retry for ever - the run finishes and the process hangs.
+        # socketio.sleep yields to the hub, which flushes the writes first.
+        self.socketio.sleep(1)
         # func = request.environ.get('werkzeug.server.shutdown')
         # if func is None:
         #     self.logger.error('Cannot shut down server. Not running with the Werkzeug Server.')
@@ -335,7 +343,11 @@ class FederatedServer:
         # 4. Avvia il primo round di training
         self.logger.info("Initialization complete. Starting federated training process.")
         # Aggiungiamo un piccolo ritardo per assicurarci che i client processino la calibrazione
-        time.sleep(10)
+        # Cooperative sleep for the same reason as in _shutdown_server: a real
+        # time.sleep here blocks the event loop, so the calibration broadcast
+        # this delay exists to give the clients time to process is not even sent
+        # until the delay is over.
+        self.socketio.sleep(10)
         self._start_next_training_round()
 
     def _on_client_update(self, data: Dict):
@@ -375,6 +387,13 @@ class FederatedServer:
                 self._trigger_global_evaluation()
 
     def _on_client_eval(self, data: Dict):
+        # Set inside the lock, acted on outside it: _shutdown_server now yields
+        # to the event loop so the shutdown packets get written, and yielding
+        # while holding this lock would be a deadlock rather than a pause. The
+        # lock is an ordinary threading.Lock and eventlet is not monkey patched,
+        # so a second handler waiting on it blocks the one OS thread the hub
+        # runs on - and the sleeping holder could never be scheduled again.
+        shutdown_after_release = False
         with self.lock:
             self.logger.info("Received evaluation from client %s.", request.sid)
             self.client_evaluations_this_round.append(data)
@@ -398,7 +417,10 @@ class FederatedServer:
 
                     for sid in self.registered_clients:
                         emit("shutdown", room=sid)
-                    self._shutdown_server()
+                    shutdown_after_release = True
                 else:
                     self.logger.info("Proceeding to the next round.")
                     self._start_next_training_round()
+
+        if shutdown_after_release:
+            self._shutdown_server()

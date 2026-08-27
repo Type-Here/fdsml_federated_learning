@@ -48,7 +48,19 @@ class FederatedClient:
             self.paillier_privkey = None
             self.keys_received_event = threading.Event()
 
-        self.sio = socketio.Client(logger=True, request_timeout=10, reconnection=True)
+        # Bounded reconnection, not endless. `reconnection_attempts=0` (the
+        # default) means "retry for ever", and the end of a run is precisely a
+        # moment where the server goes away: if the shutdown event is missed for
+        # any reason the client reconnects until killed by hand, `sio.wait()`
+        # never returns, the client thread never joins, and the worker never
+        # dequeues the next configuration - the run finishes, the process does
+        # not. Giving up turns that hang into a run that ends and writes its CSV
+        # row. A dropped client cannot be replaced mid-round anyway: the server
+        # sampled it for this round and waits for an update only it can send.
+        self.sio = socketio.Client(
+            logger=True, request_timeout=10, reconnection=True,
+            reconnection_attempts=int(self.config.get('reconnection_attempts', 10)),
+        )
         self._register_event_handlers()
         self.connect_to_server()
 
@@ -187,7 +199,12 @@ class FederatedClient:
     def _on_reconnect(self):
         self.logger.info("Reconnected to the server.")
 
-    def _on_shutdown(self):
+    def _on_shutdown(self, data: Dict = None):
+        # The server sends this event twice at the end of a run: once broadcast
+        # to every registered client with no payload, and once to whoever
+        # triggered the final aggregation, carrying the Trusted Authority
+        # address. Accept both shapes, or the second one raises inside the
+        # handler and only that client stays connected.
         self.logger.info("Received shutdown signal."); self.sio.disconnect()
 
     def _on_init(self, data: Dict):
