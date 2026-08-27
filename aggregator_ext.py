@@ -15,7 +15,8 @@ Contents:
     round payload, plus the snapshot of the parameters it is broadcasting.
   - `aggregate_weights`           : dispatch on the algorithm, including FIPA.
   - `aggregate_encrypted_updates` : makes the encrypted path honor the
-    configured aggregation algorithm instead of always weighting by size.
+    configured aggregation algorithm instead of always weighting by size, and
+    routes FIPA to its Paillier branch.
   - `aggregate_train_loss`        : a method the server calls but the base class
     never defines.
   - `register_client_stats`       : receives the per-client label distributions,
@@ -26,8 +27,9 @@ Contents:
 The algorithm families, the warmup boundary and the denominator rule live in
 `aggregation_policy`, which imports neither `aggregator` nor torch and is
 therefore testable on a machine without a GPU stack; the linear algebra of FIPA
-lives in `fipa.py`, torch-free for the same reason. This file is the part that
-has to touch tensors, and it is deliberately thin.
+lives in `fipa.py` and its Paillier arithmetic in `fipa_encrypted.py`, torch-free
+for the same reason. This file is the part that has to touch tensors, and it is
+deliberately thin.
 
 Deliberately not here yet: the FedDisco branches and the global model
 checkpoint.
@@ -39,6 +41,7 @@ from typing import Dict, List, Optional
 import numpy as np
 
 import fipa
+import fipa_encrypted
 from aggregation_policy import NEEDS_GLOBAL_WEIGHTS, SUM_WEIGHTED_BY_SIZE
 from aggregation_policy import client_denominator as denominator_for_algorithm
 from aggregation_policy import effective_algorithm as effective_algorithm_for_round
@@ -71,20 +74,15 @@ class ExtendedAggregator(Aggregator):
         self.round_number: int = 0
         self.global_weights: Optional[List[np.ndarray]] = None
 
-        algorithm = self.config.get("aggregation_algorithm", "FedAvg")
-        encryption_mode = self.config.get("encryption_mode", "no_encryption")
+        # What the clients were told to divide the round payload by, i.e. what
+        # `current_weights` is currently scaled by. The encrypted FIPA branch
+        # needs it and cannot recompute it: by the time it runs,
+        # `total_training_size_in_round` on the server already holds *this*
+        # round's total, while the payload was scaled by the previous one's.
+        self.last_broadcast_denominator: float = 0.0
 
-        # Fail here rather than at the first refinement round. Under encryption
-        # the FIPA branch would raise anyway, but only after the warmup has
-        # already burned most of the run's compute budget. The client raises the
-        # same way, so a misconfigured run dies at startup on both sides.
-        if algorithm == "FIPA" and encryption_mode != "no_encryption":
-            raise ValueError(
-                f"FIPA is only implemented on the plaintext path, but "
-                f"encryption_mode is '{encryption_mode}'. Its server-side rule "
-                f"needs a QR and an eigendecomposition, which Paillier cannot "
-                f"do. Set encryption_mode to 'no_encryption' for FIPA runs."
-            )
+        algorithm = self.config.get("aggregation_algorithm", "FedAvg")
+        self.encryption_mode: str = self.config.get("encryption_mode", "no_encryption")
 
         if algorithm == "FIPA" and self.warmup_rounds == 0:
             self.logger.warning(
@@ -96,7 +94,7 @@ class ExtendedAggregator(Aggregator):
 
         self.logger.info(
             "Using ExtendedAggregator (algorithm=%s, encryption=%s, warmup=%d).",
-            algorithm, encryption_mode, self.warmup_rounds,
+            algorithm, self.encryption_mode, self.warmup_rounds,
         )
 
     # ------------------------------------------------------------------
@@ -166,11 +164,22 @@ class ExtendedAggregator(Aggregator):
 
         # Only the delta-sending rules need theta, and keeping the snapshot to
         # the rounds that use it avoids copying the parameters every round for
-        # nothing. It also keeps this away from the encrypted path, where
-        # `current_weights` holds Paillier ciphertext dicts that cannot be
-        # divided at all.
-        if algorithm in NEEDS_GLOBAL_WEIGHTS:
+        # nothing.
+        #
+        # Never on the encrypted path, whatever the rule: there
+        # `current_weights` holds Paillier ciphertext dicts, and the division
+        # inside `_snapshot_global_weights` would raise on them. The encrypted
+        # branch does not need a snapshot anyway - it never subtracts theta from
+        # anything, it adds its increment straight onto the ciphertexts it
+        # already holds, and puts them on the right scale with a homomorphic
+        # multiplication instead.
+        if algorithm in NEEDS_GLOBAL_WEIGHTS and self.encryption_mode == 'no_encryption':
             self._snapshot_global_weights(denominator)
+
+        # Remembered rather than recomputed later: see the attribute's comment
+        # in `__init__` for why the server's own total is the wrong number by
+        # the time the aggregation runs.
+        self.last_broadcast_denominator = denominator
 
         return {
             'aggregation_algorithm': algorithm,
@@ -411,17 +420,129 @@ class ExtendedAggregator(Aggregator):
         if algorithm in SUM_WEIGHTED_BY_SIZE:
             self._require_payload_kind(round_client_updates, 'weights', algorithm)
             aggregated = self._encrypted_sum_weighted_by_size(round_client_updates)
-            if aggregated:
-                self.last_aggregation_algorithm = algorithm
-            return aggregated
+        elif algorithm == 'FIPA':
+            # 'fipa_z' and not 'delta': under encryption the client keeps the
+            # delta and sends its projection onto its own curvature directions,
+            # r ciphertexts instead of p. A plaintext delta arriving here would
+            # otherwise be aggregated as if it were that projection.
+            self._require_payload_kind(round_client_updates, 'fipa_z', algorithm)
+            aggregated = self._aggregate_fipa_encrypted(round_client_updates)
+        else:
+            # FedDisco and any future rule land here. Raising rather than
+            # silently falling back to FedAvg is the whole point of this fix: a
+            # configuration naming an algorithm we have not implemented for the
+            # encrypted path must fail loudly, not produce a mislabeled run.
+            raise ValueError(
+                f"Aggregation algorithm '{algorithm}' is not supported on the encrypted path."
+            )
 
-        # FedDisco and any future rule land here. Raising rather than
-        # silently falling back to FedAvg is the whole point of this fix: a
-        # configuration naming an algorithm we have not implemented for the
-        # encrypted path must fail loudly, not produce a mislabeled run.
-        raise ValueError(
-            f"Aggregation algorithm '{algorithm}' is not supported on the encrypted path."
+        if aggregated:
+            self.last_aggregation_algorithm = algorithm
+        return aggregated
+
+    def _aggregate_fipa_encrypted(self, client_updates: List[Dict]) -> bool:
+        """`theta <- theta + sum_m P_m z_m`, with theta and z_m encrypted.
+
+        The same rule as `_aggregate_fipa`, reached by the only route Paillier
+        leaves open. What differs from the plaintext branch is not the maths but
+        who holds what:
+
+            plaintext          the client sends Delta_m, p numbers. The server
+                               builds `H^+`, applies it to the weighted sum of
+                               the H_m Delta_m, adds the result to its snapshot
+                               of theta.
+
+            encrypted (here)   the client sends `Enc(z_m)` with
+                               `z_m = U_m^T Delta_m`, **r ciphertexts**, plus
+                               `U_m` and `L_m` in the clear. The server builds
+                               the same `H^+`, fuses it with U_m and L_m into
+                               one plaintext matrix `P_m` per client, and
+                               multiplies each ciphertext by it exactly once.
+                               It never sees a delta, and it never needs the
+                               snapshot: the increment goes straight onto the
+                               ciphertexts it already holds.
+
+        Sending only `z_m` is exact, not an approximation: every appearance of
+        `Delta_m` in the update rule sits behind `U_m^T`, so what is left out is
+        what the algorithm multiplies by zero. See `fipa.project_delta`.
+
+        What has to travel in the clear, and it is the limit of this scheme:
+        `U_m` and `L_m`, because the server runs a QR decomposition and an
+        eigendecomposition on them and neither exists for ciphertexts. `U_m` is
+        a compressed summary of the client's gradients, so this hides the
+        parameters and the updates but not the curvature.
+
+        The Paillier public key is read off the ciphertexts themselves rather
+        than configured, so the server stays key-agnostic exactly as the
+        received code intends: the Trusted Authority hands keys to clients only.
+
+        Each update carries, besides `train_size`:
+            fipa_z      `Enc(z_m)`, r ciphertexts, still pickled;
+            fipa_U      U_m, the top-r curvature directions, (p, r);
+            fipa_lambda L_m, the matching eigenvalues, (r,);
+            fipa_explained_variance
+                        how much of the gradients' variance those r directions
+                        account for - a result, not an input to the rule.
+
+        Returns:
+            True. Failure raises: an encrypted round that silently did nothing
+            would leave the previous ciphertexts in place and look like a
+            plateau.
+
+        Raises:
+            ValueError: if an update is missing its curvature factors or its
+                projection.
+        """
+        factors = []
+        projections = []
+        explained = []
+        for update in client_updates:
+            if 'fipa_U' not in update or 'fipa_lambda' not in update:
+                raise ValueError(
+                    f"Client '{update.get('client_id', '?')}' sent an encrypted "
+                    f"FIPA update without its curvature factors."
+                )
+            if 'fipa_z' not in update:
+                raise ValueError(
+                    f"Client '{update.get('client_id', '?')}' sent an encrypted "
+                    f"FIPA update without its encrypted projection."
+                )
+            # `delta=None` is the encrypted route's record: the server holds
+            # `Enc(z_m)` and no delta in any form. Everything the aggregation
+            # reads from these - the directions, the eigenvalues, the sample
+            # count - is present.
+            factors.append(fipa.ClientFactors(
+                delta=None,
+                directions=pickle_string_to_object(update['fipa_U']),
+                curvature=pickle_string_to_object(update['fipa_lambda']),
+                n_samples=float(update['train_size']),
+            ))
+            projections.append(pickle_string_to_object(update['fipa_z']))
+            explained.append(float(update.get('fipa_explained_variance', np.nan)))
+
+        rtol = float(self.config.get('fipa_pinv_rtol', fipa.DEFAULT_PINV_RTOL))
+        self.current_weights = fipa_encrypted.fipa_aggregate_encrypted(
+            model=self.current_weights,
+            # A generator, so only one (p, r) preconditioner - 5.7 MB with the
+            # ResNet18 head - exists at a time instead of one per client.
+            operators=fipa.preconditioners(factors, rtol),
+            projections=projections,
+            # What the clients divided this round's payload by, which is also
+            # what the server's own copy is still scaled by. `N` at the round
+            # where the warmup hands over to FIPA, 1.0 from then on.
+            model_denominator=self.last_broadcast_denominator,
+            logger=self.logger,
         )
+
+        mean_explained = float(np.nanmean(explained)) if explained else float('nan')
+        self.metrics_history.setdefault(self.round_number, {})[
+            'fipa_explained_variance'] = mean_explained
+        self.logger.info(
+            "Encrypted FIPA aggregation complete over %d clients (rank per "
+            "client: %s). Mean explained variance %.4f.",
+            len(factors), [len(z) for z in projections], mean_explained,
+        )
+        return True
 
     def _encrypted_sum_weighted_by_size(self, round_client_updates: List[Dict]) -> bool:
         """Homomorphic weighted summation by `train_size`.
