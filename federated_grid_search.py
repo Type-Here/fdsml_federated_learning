@@ -299,7 +299,14 @@ def main(config_path: str = GRID_SEARCH_CONFIG_PATH):
     print(f"Adding {configs_to_run_count} new unique configurations to the execution queue.")
     print("=" * 80)
 
-    if task_queue.empty():
+    # Count the puts, do not ask the queue. `multiprocessing.JoinableQueue.put`
+    # hands the object to a background feeder thread that pickles it into a
+    # pipe, so `empty()` reports the state of the *pipe*, not of the puts: right
+    # after filling the queue it can still answer True and the whole grid exits
+    # with "no new configurations" having just printed how many it added. The
+    # race is timing dependent, which is why the same command runs one time and
+    # exits the next.
+    if configs_to_run_count == 0:
         print("=== No new configurations to run. Exiting. ===")
         return
 
