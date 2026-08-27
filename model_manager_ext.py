@@ -14,13 +14,41 @@ the diff against the lab's code at exactly one line - the instantiation in
 """
 
 import logging
+import os
+import re
+import zlib
 from typing import Optional, Tuple
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
+from torchvision.datasets import ImageFolder
 
 import fipa
 from model_manager import ModelManager
+
+
+def shuffle_seed(config: dict, dataset_path: str) -> int:
+    """A seed that belongs to one client and to nobody else.
+
+    Derived from the run's `seed` and from the client's own data directory name
+    (`client_0`, `client_1`, ...), so it is stable across processes and across
+    restarts - unlike Python's `hash`, which is randomised per process unless
+    PYTHONHASHSEED is pinned before the interpreter starts.
+
+    Args:
+        config: the run configuration; only `seed` is read.
+        dataset_path: this client's data directory.
+
+    Returns:
+        A non-negative int below 2^31, which is what `torch.Generator` wants.
+    """
+    base = int(config.get('seed', 42))
+    name = os.path.basename(os.path.normpath(dataset_path))
+    trailing_number = re.search(r'(\d+)$', name)
+    offset = (int(trailing_number.group(1)) if trailing_number
+              else zlib.crc32(name.encode('utf-8')))
+    return (base + offset) % (2 ** 31)
 
 
 class ExtendedModelManager(ModelManager):
@@ -29,7 +57,50 @@ class ExtendedModelManager(ModelManager):
     Behaves exactly like the base class unless `collect_gradient_factors` is
     called, so it is safe to use for every algorithm - FedAvg runs will simply
     never call it.
+
+    It also gives the training loader a shuffle generator of its own; see
+    `_get_dataloader`.
     """
+
+    def __init__(self, config: dict, dataset_path: str):
+        # Set before super().__init__ so that a base class which ever builds a
+        # loader while constructing still finds it.
+        self._shuffle_generator = torch.Generator()
+        self._shuffle_generator.manual_seed(shuffle_seed(config, dataset_path))
+        super().__init__(config, dataset_path)
+
+    def _get_dataloader(self, split: str, batch_size: int) -> DataLoader:
+        """The base loader, with the training shuffle driven by a private RNG.
+
+        The received version passes no `generator`, so `shuffle=True` draws from
+        the **global** Torch RNG. That is reproducible in a single-threaded
+        program and not here: the clients of a run are simulated as concurrent
+        threads in one process, so seeding fixes the sequence of random numbers
+        but not how several threads divide it between them. Two runs of the same
+        configuration then see different batch orders - which is how two runs
+        that should have been identical came out with three of 330 validation
+        images classified differently.
+
+        One generator per instance, not one per call: a fresh generator reseeded
+        on every call would hand every round the *same* batch order, which is a
+        different bug. Created once, it carries on where the previous round left
+        it, deterministically, and no other client can disturb it.
+
+        This does not make a run bit-reproducible on its own. The classifier
+        head is still initialised from the global RNG inside the base
+        constructor, in those same concurrent threads, and with a frozen
+        pre-trained backbone that head is the only randomly initialised thing in
+        the model - so it remains the larger source. Removing it was a
+        deliberate decision to leave the received training scheme alone.
+        """
+        data_path = os.path.join(self.dataset_path, split)
+        if not os.path.isdir(data_path):
+            raise FileNotFoundError(f"Dataset directory not found for split '{split}': {data_path}")
+        dataset = ImageFolder(root=data_path, transform=self.transform_pipeline)
+        if split != 'train':
+            return DataLoader(dataset, batch_size=batch_size, shuffle=False)
+        return DataLoader(dataset, batch_size=batch_size, shuffle=True,
+                          generator=self._shuffle_generator)
 
     def collect_gradient_factors(self, batch_size: int, rank: int,
                                  max_batches: Optional[int] = None,
