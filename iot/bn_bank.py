@@ -1,0 +1,343 @@
+"""Building the bank: one BatchNorm state per known corruption.
+
+This is the torch half of the routing work. `iot/routing.py` decides *which*
+state to load; this module produces the states and the descriptors it decides
+between, by pushing corrupted images through the frozen backbone and watching
+what its normalization layers see.
+
+Nothing here trains anything. There is no loss, no backward, no optimizer and
+no label: a BatchNorm layer's statistics are means, not fitted parameters, so
+they are learned by looking. That is the whole reason the adaptation stage is
+cheap enough to belong on a device.
+
+    build_bank(...)  ->  for each condition, one forward pass over its images
+                         -> BNState      the running_mean / running_var to load
+                         -> BNDescriptor the summary the routing compares
+                         -> intra-condition distances, to calibrate the
+                            fallback threshold from data instead of guessing
+
+**How the statistics are accumulated, and the trap it avoids.** Over a whole
+condition the state has to describe *all* its images, but the images arrive in
+batches. The tempting route - average each batch's mean and variance - is wrong
+for the variance: the mean of the within-batch variances ignores how much the
+batch means differ from each other, so it underestimates, and the resulting BN
+layers are too narrow and saturate. The identity that repairs it is the same one
+the federated recalibration needs (total variance = mean of within-group
+variances + variance of the group means).
+
+This module sidesteps that entirely by accumulating **raw moments** - the count,
+the sum and the sum of squares per channel - and forming the mean and variance
+only once, at the end. There are no per-batch variances to average, so there is
+no identity to get wrong. It is also less code.
+
+Note that PyTorch's own accumulation does not do this: in `train()` mode
+BatchNorm updates its buffers with an exponential moving average that depends on
+the order of the batches, and even with `momentum=None` its cumulative average
+averages the per-batch variances. So the buffers are written here explicitly
+rather than harvested from a `train()` pass.
+"""
+
+from collections import OrderedDict
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+from iot.routing import BNDescriptor, BNState, descriptor_from_state, symmetric_kl
+
+__all__ = [
+    'DEFAULT_DESCRIPTOR_PREFIXES', 'BankEntry',
+    'bn_modules', 'descriptor_layer_names', 'collect_bn_state',
+    'load_bn_state', 'current_bn_state', 'build_bank', 'self_check',
+]
+
+# Which layers the descriptor is read from: the early stages only. They respond
+# to noise, contrast and frequency content - what the degradation is. The deep
+# stages respond to semantics, i.e. which sign is in the image, which is exactly
+# what the routing has to be invariant to.
+DEFAULT_DESCRIPTOR_PREFIXES: Tuple[str, ...] = ('bn1', 'layer1')
+
+# Accumulators are float64 whatever the model's dtype: a sum of squares over
+# ~30M values in float32 loses low-order bits, and the variance is a difference
+# of two large numbers where exactly those bits live.
+_ACCUM_DTYPE = torch.float64
+
+
+def bn_modules(model: nn.Module) -> "OrderedDict[str, nn.Module]":
+    """Every BatchNorm module, keyed by its dotted name, in definition order.
+
+    For ResNet18 that is 20 modules and 4800 channels: `bn1` 64, `layer1` 256,
+    `layer2` 640, `layer3` 1280, `layer4` 2560 (the deeper stages include the
+    downsample BN of their first block).
+    """
+    found = OrderedDict()
+    for name, module in model.named_modules():
+        if isinstance(module, nn.modules.batchnorm._BatchNorm):
+            found[name] = module
+    if not found:
+        raise ValueError(
+            "this model has no BatchNorm layer, so there is nothing to adapt - "
+            "ConvNet and AlexNet are in that position and cannot be used here")
+    return found
+
+
+def descriptor_layer_names(model: nn.Module,
+                           prefixes: Sequence[str] = DEFAULT_DESCRIPTOR_PREFIXES
+                           ) -> List[str]:
+    """The BN layers the descriptor is built from, in a fixed order.
+
+    The order is part of the contract between the bank and the runtime: the same
+    list must be used on both sides or the distances compare different channels.
+    """
+    names = [name for name in bn_modules(model)
+             if any(name == p or name.startswith(p + '.') for p in prefixes)]
+    if not names:
+        raise ValueError(
+            f"no BatchNorm layer matches {list(prefixes)}; the model has "
+            f"{list(bn_modules(model))[:5]}...")
+    return names
+
+
+class _InputMoments:
+    """Raw per-channel moments of what each BatchNorm layer is fed.
+
+    Hooks read the layer's **input**, never its output. The output is already
+    normalised by whichever state is currently loaded, so a descriptor built
+    from it would depend on the choice it is meant to drive - the routing would
+    oscillate between identical batches, and nothing would raise.
+    """
+
+    def __init__(self, model: nn.Module, names: Optional[Sequence[str]] = None):
+        modules = bn_modules(model)
+        self.names = list(names) if names is not None else list(modules)
+        self._handles = []
+        self._count: Dict[str, float] = {}
+        self._sum: Dict[str, torch.Tensor] = {}
+        self._sum_sq: Dict[str, torch.Tensor] = {}
+
+        for name in self.names:
+            module = modules[name]
+            self._handles.append(
+                module.register_forward_pre_hook(self._make_hook(name)))
+
+    def _make_hook(self, name: str):
+        def hook(_module, inputs):
+            x = inputs[0].detach().to(_ACCUM_DTYPE)
+            # (N, C, H, W) -> per-channel; also tolerate (N, C) for a 1-D BN.
+            dims = [0] + list(range(2, x.dim()))
+            total = x.sum(dim=dims)
+            total_sq = (x * x).sum(dim=dims)
+            n = x.numel() / x.shape[1]
+            if name in self._sum:
+                self._sum[name] += total
+                self._sum_sq[name] += total_sq
+                self._count[name] += n
+            else:
+                self._sum[name] = total
+                self._sum_sq[name] = total_sq
+                self._count[name] = n
+        return hook
+
+    def remove(self) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles = []
+
+    def state(self) -> BNState:
+        """mean = S/n, var = S2/n - mean^2, computed once at the end."""
+        if not self._sum:
+            raise RuntimeError("no batch was ever passed through the model")
+        result: BNState = {}
+        for name in self.names:
+            n = self._count[name]
+            mean = self._sum[name] / n
+            var = self._sum_sq[name] / n - mean * mean
+            # A tiny negative value here is float cancellation on a near-constant
+            # channel, not a bug in the data.
+            var = torch.clamp(var, min=0.0)
+            result[name] = (mean.cpu().numpy(), var.cpu().numpy())
+        return result
+
+
+@torch.no_grad()
+def collect_bn_state(model: nn.Module, loader, device: torch.device,
+                     names: Optional[Sequence[str]] = None,
+                     max_batches: Optional[int] = None) -> BNState:
+    """One forward pass over `loader`, returning the statistics it produced.
+
+    `model.eval()` throughout: train mode would let Dropout make each forward a
+    different random function and would let BatchNorm overwrite the very buffers
+    this is measuring.
+
+    Args:
+        model: the network, already on `device`.
+        loader: yields `(images, labels)`; the labels are ignored, because this
+            stage has none to use.
+        device: where to run.
+        names: which BN layers to record. None records all of them, which is
+            what a bank state needs; a descriptor uses a subset.
+        max_batches: stop early, for a smoke check.
+
+    Returns:
+        `{layer name: (mean, var)}` as numpy arrays.
+    """
+    was_training = model.training
+    model.eval()
+    moments = _InputMoments(model, names)
+    try:
+        for index, batch in enumerate(loader):
+            if max_batches is not None and index >= max_batches:
+                break
+            images = batch[0] if isinstance(batch, (tuple, list)) else batch
+            model(images.to(device, non_blocking=True))
+    finally:
+        moments.remove()
+        model.train(was_training)
+    return moments.state()
+
+
+def current_bn_state(model: nn.Module) -> BNState:
+    """The statistics the model is carrying right now.
+
+    For a checkpoint straight out of federated training these are ImageNet's:
+    BatchNorm's buffers are not parameters, so no aggregation round ever touched
+    them. That state is the "source" the blending in `routing.blend` mixes
+    against, and the baseline every adapted result is compared to.
+    """
+    return {name: (module.running_mean.detach().cpu().numpy().copy(),
+                   module.running_var.detach().cpu().numpy().copy())
+            for name, module in bn_modules(model).items()
+            if module.running_mean is not None}
+
+
+def load_bn_state(model: nn.Module, state: BNState, strict: bool = True) -> None:
+    """Write a state into the model's BatchNorm buffers, in place.
+
+    With the model in `eval()` this is the whole of the adaptation: the layers
+    then normalise with these numbers instead of the ones they were shipped
+    with. The trainable head is untouched, and has no BatchNorm of its own, so
+    the two halves of the project never collide.
+    """
+    modules = bn_modules(model)
+    for name, (mean, var) in state.items():
+        if name not in modules:
+            if strict:
+                raise KeyError(f"the model has no BatchNorm layer '{name}'")
+            continue
+        module = modules[name]
+        target = module.running_mean
+        if target is None:
+            # track_running_stats=False: the layer has no buffers to write into
+            # and always uses batch statistics. Nothing to load, and silently
+            # skipping it would make the bank look applied when it was not.
+            raise ValueError(
+                f"layer '{name}' keeps no running statistics, so a bank state "
+                f"cannot be loaded into it")
+        if target.shape != torch.Size(mean.shape):
+            raise ValueError(
+                f"layer '{name}': state has {mean.shape} channels, model wants "
+                f"{tuple(target.shape)} - these came from different models")
+        module.running_mean.copy_(torch.as_tensor(mean, dtype=target.dtype,
+                                                  device=target.device))
+        module.running_var.copy_(torch.as_tensor(var, dtype=target.dtype,
+                                                 device=target.device))
+
+
+class BankEntry:
+    """One known condition: what to load, and how to recognise it."""
+
+    __slots__ = ('label', 'state', 'descriptor')
+
+    def __init__(self, label: str, state: BNState, descriptor: BNDescriptor):
+        self.label = label
+        self.state = state
+        self.descriptor = descriptor
+
+    def __repr__(self) -> str:
+        return f"BankEntry({self.label!r}, {self.descriptor.num_channels} channels)"
+
+
+def build_bank(model: nn.Module, loaders: "OrderedDict[str, object]",
+               device: torch.device,
+               descriptor_prefixes: Sequence[str] = DEFAULT_DESCRIPTOR_PREFIXES,
+               calibration_batches: int = 8
+               ) -> Tuple[List[BankEntry], List[float]]:
+    """Build one entry per condition, plus the distances to calibrate on.
+
+    `loaders` maps a condition label to its DataLoader, and **must include
+    `clean`**. A bank of corruptions only would send a device that is looking at
+    clean images to the nearest corruption and leave it worse off than doing
+    nothing at all.
+
+    The second return value is the intra-condition distances: for every
+    condition, the descriptor of a few individual batches measured against that
+    condition's own stored state. They are the spread of "a batch that really
+    does belong here", and `routing.calibrate_threshold` turns them into the
+    fallback threshold - so the threshold comes from data rather than taste.
+
+    Returns:
+        `(entries, intra_distances)`.
+    """
+    layer_names = descriptor_layer_names(model, descriptor_prefixes)
+    entries: List[BankEntry] = []
+    intra: List[float] = []
+
+    for label, loader in loaders.items():
+        state = collect_bn_state(model, loader, device)
+        descriptor = descriptor_from_state(state, layer_names, label)
+        entries.append(BankEntry(label, state, descriptor))
+
+        # A handful of single-batch descriptors against the entry just built.
+        # One batch is exactly what the router will see at runtime, so this
+        # measures the right thing rather than a smoothed version of it.
+        for index, batch in enumerate(loader):
+            if index >= calibration_batches:
+                break
+            batch_state = collect_bn_state(model, [batch], device, names=layer_names)
+            batch_descriptor = descriptor_from_state(batch_state, layer_names, label)
+            intra.append(symmetric_kl(batch_descriptor, descriptor))
+
+    if 'clean' not in loaders:
+        raise ValueError(
+            "the bank has no 'clean' entry; without it a device looking at "
+            "undegraded images is routed to the nearest corruption")
+    return entries, intra
+
+
+@torch.no_grad()
+def self_check(model: nn.Module, loader, device: torch.device,
+              tolerance: float = 1e-6) -> Dict[str, float]:
+    """Verify the accumulation against the same statistics computed in one go.
+
+    The batched accumulation is the one piece here that can be wrong while
+    looking right - a state that is quietly too narrow still loads, still
+    classifies, and only shows up as a disappointing number. This runs the same
+    data twice, once batch by batch and once as a single concatenated batch, and
+    the two must agree. Cheap enough to run on a few hundred images before
+    trusting a whole bank.
+
+    Returns the largest relative discrepancy found, per statistic.
+    """
+    batches = [b[0] if isinstance(b, (tuple, list)) else b for b in loader]
+    if not batches:
+        raise ValueError("the loader yielded nothing")
+
+    incremental = collect_bn_state(model, [(b,) for b in batches], device)
+    at_once = collect_bn_state(model, [(torch.cat(batches, dim=0),)], device)
+
+    worst = {'mean': 0.0, 'var': 0.0}
+    for name, (mean, var) in incremental.items():
+        reference_mean, reference_var = at_once[name]
+        scale_mean = np.maximum(np.abs(reference_mean), 1e-8)
+        scale_var = np.maximum(np.abs(reference_var), 1e-8)
+        worst['mean'] = max(worst['mean'],
+                            float(np.max(np.abs(mean - reference_mean) / scale_mean)))
+        worst['var'] = max(worst['var'],
+                           float(np.max(np.abs(var - reference_var) / scale_var)))
+
+    if worst['mean'] > tolerance or worst['var'] > tolerance:
+        raise AssertionError(
+            f"batched accumulation disagrees with the single-pass reference: "
+            f"mean {worst['mean']:.2e}, var {worst['var']:.2e} (tolerance {tolerance:.0e})")
+    return worst
