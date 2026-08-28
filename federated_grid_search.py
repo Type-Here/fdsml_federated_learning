@@ -124,10 +124,15 @@ def run_grid_search_worker(
             worker_log_dir = os.path.join(config['base_log_path']+f'_{pc_name}', run_identifier)
             worker_plot_dir = os.path.join(config['base_plot_path']+f'_{pc_name}', run_identifier)
             worker_metrics_dir = os.path.join(config['base_csv_path']+f'_{pc_name}', "runs")
+            # Not per run_identifier like the logs: checkpoints from every worker
+            # collect in one directory, because what comes next reads them as a
+            # set - one model per configuration, compared side by side.
+            worker_checkpoint_dir = config.get('base_checkpoint_path', 'checkpoints') + f'_{pc_name}'
             os.makedirs(worker_splitting_dir, exist_ok=True)
             os.makedirs(worker_log_dir, exist_ok=True)
             os.makedirs(worker_plot_dir, exist_ok=True)
             os.makedirs(worker_metrics_dir, exist_ok=True)
+            os.makedirs(worker_checkpoint_dir, exist_ok=True)
             print("\n" + "#" * 80)
             print(f"### [Worker {worker_id}] DEQUEUED NEW CONFIG FOR: {dataset_name} | {config['model_name']} ###")
             config['worker_id'] = worker_id
@@ -144,6 +149,7 @@ def run_grid_search_worker(
             config['log_dir'] = worker_log_dir
             config['plot_dir'] = worker_plot_dir
             config['run_metrics_output_path'] = worker_metrics_dir
+            config['run_checkpoint_output_path'] = worker_checkpoint_dir
             config["MIN_NUM_WORKERS"] = int(config['num_clients'] * config['models_percentage'])
             ta_instance_ref = [];
             server_instance_ref = []
