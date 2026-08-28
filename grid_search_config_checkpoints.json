@@ -1,4 +1,5 @@
 {
+  "_comment": "Four runs whose purpose is to produce checkpoints for the inference-time work, while the full grid waits for FedDisco. They are a strict SUBSET of grid_search_config.json - same paths, same fixed parameters, every axis narrowed to values that file already contains - so their rows land in the same shared results CSV and the full grid will skip them by fingerprint and run 41 instead of 45. Do not edit an axis here without making the same value exist there, or the work is done twice. ResNet18 only: BatchNorm is what the adaptation stage adjusts, and ConvNet has none. FedProx is left out because its server-side arithmetic is identical to FedAvg's.",
   "ip_address": "127.0.0.1",
   "port": 5001,
   "base_csv_path": "csv",
@@ -28,12 +29,10 @@
       30
     ],
     "local_epoch": [
-      1,
-      5
+      1
     ],
     "num_clients": [
-      4,
-      8
+      4
     ],
     "models_percentage": [
       1
@@ -46,7 +45,6 @@
     ],
     "aggregation_algorithm": [
       "FedAvg",
-      "FedProx",
       "FIPA"
     ],
     "fedprox_mu": [
@@ -57,8 +55,7 @@
     ],
     "dirichlet_alpha": [
       0.1,
-      0.5,
-      1.0
+      0.5
     ],
     "partition_unit": [
       "track"
@@ -83,23 +80,6 @@
       ],
       "num_custom_layers": [
         2
-      ]
-    },
-    "ConvNet": {
-      "image_size": [
-        128
-      ],
-      "convnet_hidden1": [
-        32
-      ],
-      "convnet_hidden2": [
-        16
-      ],
-      "local_epoch": [
-        1
-      ],
-      "num_clients": [
-        4
       ]
     }
   }
