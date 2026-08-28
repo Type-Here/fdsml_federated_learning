@@ -338,15 +338,32 @@ def _report_progress(done: int, total: int, started: float) -> None:
     print(f"  {done}/{total} images  |  {rate:.1f} img/s  |  eta {eta / 60:.1f} min", flush=True)
 
 
+def _package_version(name: str) -> str:
+    """The installed version of a package, whether or not it exposes one.
+
+    `imagecorruptions` has no `__version__` attribute, and it is the single most
+    important version in this manifest: it decides what the corruptions actually
+    do. Ask the installed distribution metadata rather than the module, which is
+    also the only thing that works for a package installed from a wheel with no
+    attribute at all.
+    """
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+        return version(name)
+    except Exception:
+        module = sys.modules.get(name)
+        return str(getattr(module, '__version__', 'unknown'))
+
+
 def _versions() -> Dict[str, str]:
-    import skimage
-    import imagecorruptions
+    import skimage  # noqa: F401  (imported for the metadata lookup below)
+    import imagecorruptions  # noqa: F401
     return {
         'python': platform.python_version(),
         'numpy': np.__version__,
-        'scikit-image': skimage.__version__,
-        'imagecorruptions': getattr(imagecorruptions, '__version__', 'unknown'),
-        'pillow': Image.__version__ if hasattr(Image, '__version__') else 'unknown',
+        'scikit-image': _package_version('scikit-image'),
+        'imagecorruptions': _package_version('imagecorruptions'),
+        'pillow': _package_version('pillow'),
     }
 
 
