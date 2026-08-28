@@ -171,3 +171,5 @@ csv*/
 logs*/
 static/plots*/
 checkpoints*/
+
+models/
