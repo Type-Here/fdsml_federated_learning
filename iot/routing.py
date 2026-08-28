@@ -37,7 +37,7 @@ would switch normalisation states when the traffic sign changes.
 """
 
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 

@@ -60,10 +60,11 @@ import json
 import multiprocessing
 import os
 import platform
+import re
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image
@@ -128,6 +129,36 @@ RESAMPLING = Image.Resampling.BILINEAR
 def condition_name(corruption: str, severity: int) -> str:
     """Directory name for one (corruption, severity) pair."""
     return f"{corruption}_s{severity}"
+
+
+# The stream evaluation visits `clean` twice - once at the head and once after
+# every corruption - so that what the adaptation costs on undegraded input is a
+# measured number rather than an assumption. The second visit is its own row in
+# the results table but the same condition on disk, which is what this suffix
+# has to be stripped for.
+REVISIT_SUFFIX = '_again'
+
+_CONDITION_PATTERN = re.compile(r'^(?P<corruption>.+)_s(?P<severity>\d+)$')
+
+
+def parse_condition(condition: str) -> Tuple[str, Optional[int]]:
+    """`fog_s5` -> `('fog', 5)`, `clean` -> `('clean', None)`.
+
+    The inverse of `condition_name`, and the only place the directory name is
+    taken apart. It lives here rather than in the evaluation because the naming
+    convention belongs to whoever writes the directories; a second parser
+    elsewhere would drift from this one the first time a name changes.
+
+    A trailing `_again` is stripped first: the stream revisits a condition under
+    a distinct row label, and that label must still resolve to the condition it
+    is a second visit of.
+    """
+    if condition.endswith(REVISIT_SUFFIX):
+        condition = condition[:-len(REVISIT_SUFFIX)]
+    match = _CONDITION_PATTERN.match(condition)
+    if not match:
+        return condition, None
+    return match.group('corruption'), int(match.group('severity'))
 
 
 def derive_seed(*parts) -> int:
