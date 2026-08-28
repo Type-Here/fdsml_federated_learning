@@ -50,6 +50,7 @@ __all__ = [
     'DEFAULT_DESCRIPTOR_PREFIXES', 'BankEntry',
     'bn_modules', 'descriptor_layer_names', 'collect_bn_state',
     'load_bn_state', 'current_bn_state', 'build_bank', 'self_check',
+    'restrict_state', 'check_descriptor_independence', 'DescriptorProbe',
 ]
 
 # Which layers the descriptor is read from: the early stages only. They respond
@@ -97,6 +98,69 @@ def descriptor_layer_names(model: nn.Module,
             f"no BatchNorm layer matches {list(prefixes)}; the model has "
             f"{list(bn_modules(model))[:5]}...")
     return names
+
+
+def check_descriptor_independence(model: nn.Module,
+                                 descriptor_layers: Sequence[str],
+                                 adapted_layers: Sequence[str]) -> None:
+    """Refuse a descriptor whose input depends on a state the router will swap.
+
+    This is the subtle half of the "read the input, never the output" rule, and
+    it is the one that survives a careless reading of it. Reading `bn1`'s input
+    is safe: it is `conv1`'s output, and `conv1` is frozen, so the same batch
+    always produces the same numbers there. Reading `layer1.0.bn2`'s input is
+    **not** safe if `layer1.0.bn1` is one of the layers the bank overwrites -
+    that input has already been normalised by whichever state is loaded, so the
+    descriptor would move when the routing decision moves.
+
+    What that failure looks like: the bank's descriptors were measured under the
+    source state, the query's under the state chosen for the previous batch, and
+    the two are no longer comparable. Distances inflate, the fallback fires on
+    conditions the bank does contain, and the decision oscillates between
+    identical batches. Nothing raises, and the run just looks disappointing.
+
+    Two ways out, and this project takes the first:
+
+        descriptor = ('bn1',)                adapt everything, describe from the
+                                             one layer no state can reach
+        adapt from 'layer2' onward           describe from `bn1` + `layer1`, and
+                                             give up adapting the first stage
+
+    Ordering uses `named_modules`, which for a ResNet is execution order and,
+    where it is not (a downsample branch), is conservative - it can refuse a
+    combination that would have been fine, never accept one that is not.
+
+    Raises:
+        ValueError: if any adapted BatchNorm precedes any descriptor layer.
+    """
+    order = {name: index for index, name in enumerate(bn_modules(model))}
+    unknown = [n for n in list(descriptor_layers) + list(adapted_layers) if n not in order]
+    if unknown:
+        raise KeyError(f"not BatchNorm layers of this model: {unknown}")
+
+    adapted = set(adapted_layers)
+    for name in descriptor_layers:
+        upstream = sorted(a for a in adapted if order[a] < order[name])
+        if upstream:
+            raise ValueError(
+                f"descriptor layer '{name}' sits downstream of adapted layer(s) "
+                f"{upstream[:3]}, so its input changes with the state that gets "
+                f"loaded and the descriptor would depend on the decision it "
+                f"drives; either describe from '{list(order)[0]}' alone or stop "
+                f"adapting the layers before it")
+
+
+def restrict_state(state: BNState, names: Sequence[str]) -> BNState:
+    """The part of a state covering `names` only.
+
+    Used to hold the first stage fixed while adapting the rest: a bank entry is
+    collected over every BatchNorm layer, and this is what selects the subset
+    that is actually written back into the model.
+    """
+    missing = [n for n in names if n not in state]
+    if missing:
+        raise KeyError(f"the state does not cover {missing}")
+    return {name: state[name] for name in names}
 
 
 class _InputMoments:
@@ -158,6 +222,52 @@ class _InputMoments:
             var = torch.clamp(var, min=0.0)
             result[name] = (mean.cpu().numpy(), var.cpu().numpy())
         return result
+
+
+class DescriptorProbe:
+    """The current batch's descriptor, read out of the pass that classifies it.
+
+    This is what makes the runtime cost of routing honest. `collect_bn_state`
+    would give the same numbers, but by running the network a second time - and
+    a method whose selling point is "one forward pass, no gradient, no label"
+    cannot afford a second forward pass to decide what to do. The hooks stay
+    registered for the whole stream and the accumulators are reset between
+    batches, so the descriptor is a by-product of work that had to happen
+    anyway.
+
+        with DescriptorProbe(model, layers) as probe:
+            for images in stream:
+                probe.reset()
+                logits = model(images)
+                descriptor = probe.descriptor()
+
+    The layers it reads must be **upstream of everything the router swaps** -
+    see `check_descriptor_independence`, which the caller is expected to have
+    called first.
+    """
+
+    def __init__(self, model: nn.Module, layers: Sequence[str]):
+        self._moments = _InputMoments(model, layers)
+        self._layers = list(layers)
+
+    def __enter__(self) -> "DescriptorProbe":
+        return self
+
+    def __exit__(self, *exception) -> None:
+        self.close()
+
+    def reset(self) -> None:
+        """Forget the previous batch. Call before every forward."""
+        self._moments._count.clear()
+        self._moments._sum.clear()
+        self._moments._sum_sq.clear()
+
+    def descriptor(self, label: str = 'batch') -> BNDescriptor:
+        """What the last forward pass saw, as a comparable descriptor."""
+        return descriptor_from_state(self._moments.state(), self._layers, label)
+
+    def close(self) -> None:
+        self._moments.remove()
 
 
 @torch.no_grad()
@@ -261,7 +371,8 @@ class BankEntry:
 def build_bank(model: nn.Module, loaders: "OrderedDict[str, object]",
                device: torch.device,
                descriptor_prefixes: Sequence[str] = DEFAULT_DESCRIPTOR_PREFIXES,
-               calibration_batches: int = 8
+               calibration_batches: int = 8,
+               max_batches: Optional[int] = None
                ) -> Tuple[List[BankEntry], List[float]]:
     """Build one entry per condition, plus the distances to calibrate on.
 
@@ -276,15 +387,26 @@ def build_bank(model: nn.Module, loaders: "OrderedDict[str, object]",
     does belong here", and `routing.calibrate_threshold` turns them into the
     fallback threshold - so the threshold comes from data rather than taste.
 
+    Args:
+        max_batches: cut every condition short. For a smoke run only - a state
+            built from two batches describes two batches, and the threshold
+            calibrated beside it is meaningless. Never set it for a bank that
+            will produce a number.
+
     Returns:
         `(entries, intra_distances)`.
     """
+    if 'clean' not in loaders:
+        raise ValueError(
+            "the bank has no 'clean' entry; without it a device looking at "
+            "undegraded images is routed to the nearest corruption")
+
     layer_names = descriptor_layer_names(model, descriptor_prefixes)
     entries: List[BankEntry] = []
     intra: List[float] = []
 
     for label, loader in loaders.items():
-        state = collect_bn_state(model, loader, device)
+        state = collect_bn_state(model, loader, device, max_batches=max_batches)
         descriptor = descriptor_from_state(state, layer_names, label)
         entries.append(BankEntry(label, state, descriptor))
 
@@ -298,10 +420,6 @@ def build_bank(model: nn.Module, loaders: "OrderedDict[str, object]",
             batch_descriptor = descriptor_from_state(batch_state, layer_names, label)
             intra.append(symmetric_kl(batch_descriptor, descriptor))
 
-    if 'clean' not in loaders:
-        raise ValueError(
-            "the bank has no 'clean' entry; without it a device looking at "
-            "undegraded images is routed to the nearest corruption")
     return entries, intra
 
 
@@ -316,6 +434,24 @@ def self_check(model: nn.Module, loader, device: torch.device,
     data twice, once batch by batch and once as a single concatenated batch, and
     the two must agree. Cheap enough to run on a few hundred images before
     trusting a whole bank.
+
+    **What it catches, and what it cannot.** Both sides go through the same
+    `_InputMoments`, so this is a check on *additivity*, not on the formula:
+
+        caught      per-batch variances being averaged (the D5-shaped bug this
+                    exists for: the one-batch reference has nothing to average,
+                    so the two sides diverge immediately); any return to
+                    PyTorch's own `train()` accumulation, whose exponential
+                    moving average depends on batch order; float32 accumulators
+                    losing the low-order bits the variance is a difference of;
+                    accumulator state leaking between batches
+        NOT caught   a wrong reduction axis, a wrong element count, a wrong
+                    variance identity - all three would be wrong *identically*
+                    on both sides and the check would pass
+
+    That is acceptable because the second group fails loudly elsewhere - a wrong
+    axis gives a state whose shape does not match the layer and `load_bn_state`
+    raises - while the first group is the family that fails silently.
 
     Returns the largest relative discrepancy found, per statistic.
     """
