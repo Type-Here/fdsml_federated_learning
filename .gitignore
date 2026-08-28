@@ -170,4 +170,4 @@ run_dataset*/
 csv*/
 logs*/
 static/plots*/
-checkpoints/
+checkpoints*/
