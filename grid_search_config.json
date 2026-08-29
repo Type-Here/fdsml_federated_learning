@@ -74,6 +74,9 @@
     ],
     "fipa_pinv_rtol": [
       1e-8
+    ],
+    "train_augmentation": [
+      false
     ]
   },
   "model_specific_search_space": {

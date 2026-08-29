@@ -1,5 +1,5 @@
 {
-  "_comment": "Four runs whose purpose is to produce checkpoints for the inference-time work, while the full grid waits for FedDisco. They are a strict SUBSET of grid_search_config.json - same paths, same fixed parameters, every axis narrowed to values that file already contains - so their rows land in the same shared results CSV and the full grid will skip them by fingerprint and run 41 instead of 45. Do not edit an axis here without making the same value exist there, or the work is done twice. ResNet18 only: BatchNorm is what the adaptation stage adjusts, and ConvNet has none. FedProx is left out because its server-side arithmetic is identical to FedAvg's.",
+  "_comment": "Four runs whose purpose is to produce checkpoints for the inference-time work, while the full grid waits for FedDisco. They are a strict SUBSET of grid_search_config.json - same paths, same fixed parameters, every axis narrowed to values that file already contains - so their rows land in the same shared results CSV and the full grid will skip them by fingerprint and run 41 instead of 45. Do not edit an axis here without making the same value exist there, or the work is done twice. ResNet18 only: BatchNorm is what the adaptation stage adjusts, and ConvNet has none. FedProx is left out because its server-side arithmetic is identical to FedAvg's. train_augmentation is declared false rather than left absent: false is what the code already defaults to, so this changes no fingerprint and no behaviour, it only makes a measured decision visible in the file that produces the checkpoints. It was measured, not assumed - a paired centralised comparison over 15 rounds, same cell, augmentation off against on, reached f1 0.617 at round 7 without it and 0.557 at round 13 with it. Rotation, translation and scale cannot help a backbone that is frozen: the features are fixed, so the extra poses only spread the same 43 classes more thinly across a feature space the head cannot reshape.",
   "ip_address": "127.0.0.1",
   "port": 5001,
   "base_csv_path": "csv",
@@ -71,6 +71,9 @@
     ],
     "fipa_pinv_rtol": [
       1e-8
+    ],
+    "train_augmentation": [
+      false
     ]
   },
   "model_specific_search_space": {
