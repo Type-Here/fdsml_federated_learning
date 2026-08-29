@@ -112,10 +112,19 @@ class ExtendedModelManager(ModelManager):
                 f"would fill the corners it creates with mid-grey instead of "
                 f"black, silently.")
 
+        # `interpolation` is spelled out because RandomAffine's default is
+        # NEAREST - unlike almost every other geometric transform in
+        # torchvision - and nearest-neighbour resampling of a rotation puts
+        # jagged edges and aliasing on every augmented image. On a frozen
+        # ImageNet backbone that artefact is itself a distribution shift, so the
+        # augmentation would be measured together with the damage it does.
+        # `fill` stays at black: the corners a rotation opens up are outside the
+        # sign, and black is what the received pipeline would show there anyway.
         affine = transforms.RandomAffine(
             degrees=spec.degrees,
             translate=(spec.translate, spec.translate),
             scale=spec.scale,
+            interpolation=transforms.InterpolationMode.BILINEAR,
         )
         return transforms.Compose([base[0], affine] + base[1:])
 
