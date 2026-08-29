@@ -1,0 +1,93 @@
+{
+  "_comment": "Is the starting model worth changing before the checkpoint runs? Three centralised cells, one client, no aggregation - the same gate as the other diagnostic configs, so a number here is comparable with the 0.606 f1 already measured for ResNet18 / 128 / num_custom_layers 2. That cell is deliberately NOT repeated: its fingerprint already sits in the diagnostic results CSV and would be skipped anyway. Two questions, one axis each. Resolution: the backbone was pretrained at 224 and is being fed 128, which for a FROZEN backbone costs more than for a fine-tuned one. Depth: ResNet34 was dropped from the grid as the 'does this survive a bigger backbone' control, and this is that question asked cheaply. Same _diagnostic paths as the other two, so nothing reaches the real results CSV.",
+  "ip_address": "127.0.0.1",
+  "port": 5401,
+  "base_csv_path": "csv_diagnostic",
+  "base_log_path": "logs_diagnostic",
+  "base_plot_path": "static/plots_diagnostic",
+  "base_split_data_path": "run_dataset_diagnostic",
+  "base_checkpoint_path": "checkpoints_diagnostic",
+  "early_stop_patience": 999,
+  "weighted_aggregation": true,
+  "num_parallel_executions": 1,
+  "seed": 42,
+  "datasets": [
+    {
+      "name": "gtsrb",
+      "path": "dataset/gtsrb/train",
+      "num_classes": 43
+    }
+  ],
+  "common_search_space": {
+    "encryption_mode": [
+      "no_encryption"
+    ],
+    "device": [
+      "cuda"
+    ],
+    "global_epoch": [
+      5
+    ],
+    "local_epoch": [
+      1
+    ],
+    "num_clients": [
+      1
+    ],
+    "models_percentage": [
+      1
+    ],
+    "learning_rate": [
+      0.001
+    ],
+    "batch_size": [
+      16
+    ],
+    "aggregation_algorithm": [
+      "FedAvg"
+    ],
+    "fedprox_mu": [
+      0.05
+    ],
+    "partition_strategy": [
+      "dirichlet"
+    ],
+    "dirichlet_alpha": [
+      100.0
+    ],
+    "partition_unit": [
+      "track"
+    ],
+    "fipa_warmup_rounds": [
+      3
+    ],
+    "fipa_rank": [
+      5
+    ],
+    "fipa_grad_batches": [
+      64
+    ],
+    "fipa_pinv_rtol": [
+      1e-8
+    ]
+  },
+  "model_specific_search_space": {
+    "ResNet18": {
+      "image_size": [
+        128,
+        224
+      ],
+      "num_custom_layers": [
+        2
+      ]
+    },
+    "ResNet34": {
+      "image_size": [
+        128
+      ],
+      "num_custom_layers": [
+        2
+      ]
+    }
+  }
+}

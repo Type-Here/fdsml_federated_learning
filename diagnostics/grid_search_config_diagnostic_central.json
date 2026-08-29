@@ -1,0 +1,85 @@
+{
+  "_comment": "GATE RUN. One client, so there is no aggregation at all: the server sums one weighted update and the client divides by the same total, which is the identity. What is left is exactly the pieces every other run shares - the pretrained backbone, the transform, the head, the learning rate. If the head does not learn HERE, nothing measured in a federated run says anything about aggregation. Separate base paths from every other config on purpose: these rows must never reach the real results CSV, and must never deduplicate against it. early_stop_patience is effectively disabled so the whole trajectory is visible.",
+  "ip_address": "127.0.0.1",
+  "port": 5401,
+  "base_csv_path": "csv_diagnostic",
+  "base_log_path": "logs_diagnostic",
+  "base_plot_path": "static/plots_diagnostic",
+  "base_split_data_path": "run_dataset_diagnostic",
+  "base_checkpoint_path": "checkpoints_diagnostic",
+  "early_stop_patience": 999,
+  "weighted_aggregation": true,
+  "num_parallel_executions": 1,
+  "seed": 42,
+  "datasets": [
+    {
+      "name": "gtsrb",
+      "path": "dataset/gtsrb/train",
+      "num_classes": 43
+    }
+  ],
+  "common_search_space": {
+    "encryption_mode": [
+      "no_encryption"
+    ],
+    "device": [
+      "cuda"
+    ],
+    "global_epoch": [
+      5
+    ],
+    "local_epoch": [
+      1
+    ],
+    "num_clients": [
+      1
+    ],
+    "models_percentage": [
+      1
+    ],
+    "learning_rate": [
+      0.001
+    ],
+    "batch_size": [
+      16
+    ],
+    "aggregation_algorithm": [
+      "FedAvg"
+    ],
+    "fedprox_mu": [
+      0.05
+    ],
+    "partition_strategy": [
+      "dirichlet"
+    ],
+    "dirichlet_alpha": [
+      100.0
+    ],
+    "partition_unit": [
+      "track"
+    ],
+    "fipa_warmup_rounds": [
+      3
+    ],
+    "fipa_rank": [
+      5
+    ],
+    "fipa_grad_batches": [
+      64
+    ],
+    "fipa_pinv_rtol": [
+      1e-8
+    ]
+  },
+  "model_specific_search_space": {
+    "ResNet18": {
+      "image_size": [
+        128
+      ],
+      "num_custom_layers": [
+        1,
+        2
+      ]
+    }
+  }
+}
