@@ -25,6 +25,7 @@ from torch.utils.data import DataLoader
 from torchvision.datasets import ImageFolder
 
 import fipa
+from class_mapping import remap_imagefolder_targets
 from model_manager import ModelManager
 
 
@@ -33,7 +34,7 @@ def shuffle_seed(config: dict, dataset_path: str) -> int:
 
     Derived from the run's `seed` and from the client's own data directory name
     (`client_0`, `client_1`, ...), so it is stable across processes and across
-    restarts - unlike Python's `hash`, which is randomised per process unless
+    restarts - unlike Python's `hash`, which is randomized per process unless
     PYTHONHASHSEED is pinned before the interpreter starts.
 
     Args:
@@ -70,7 +71,20 @@ class ExtendedModelManager(ModelManager):
         super().__init__(config, dataset_path)
 
     def _get_dataloader(self, split: str, batch_size: int) -> DataLoader:
-        """The base loader, with the training shuffle driven by a private RNG.
+        """The base loader, with canonical labels and a private shuffle RNG.
+
+        **The labels.** `ImageFolder` numbers the class subdirectories it finds,
+        alphabetically, from 0 - and a client's split holds only the classes it
+        actually received. So a validation share missing three classes shifts
+        every label after the first gap, and two clients holding different
+        classes disagree about what output unit 1 means. Neither raises.
+        `class_mapping.remap_imagefolder_targets` replaces those local numbers
+        with the ones derived from the whole dataset, which are the numbers the
+        partition was written with. See that module for what it costs to skip.
+
+        The mapping comes from `config['dataset_path']`, the source root that
+        holds every class - not from `self.dataset_path`, which is this client's
+        subtree and cannot know the classes it does not have.
 
         The received version passes no `generator`, so `shuffle=True` draws from
         the **global** Torch RNG. That is reproducible in a single-threaded
@@ -97,6 +111,7 @@ class ExtendedModelManager(ModelManager):
         if not os.path.isdir(data_path):
             raise FileNotFoundError(f"Dataset directory not found for split '{split}': {data_path}")
         dataset = ImageFolder(root=data_path, transform=self.transform_pipeline)
+        remap_imagefolder_targets(dataset, self.config['dataset_path'])
         if split != 'train':
             return DataLoader(dataset, batch_size=batch_size, shuffle=False)
         return DataLoader(dataset, batch_size=batch_size, shuffle=True,

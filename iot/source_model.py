@@ -78,6 +78,7 @@ import torch
 from torch.utils.data import DataLoader
 from torchvision.datasets import ImageFolder
 
+from class_mapping import assert_canonical_labels
 from iot.bn_bank import bn_modules, collect_bn_state, load_bn_state
 from iot.routing import BNState
 
@@ -170,6 +171,11 @@ def image_folder_loader(root: str, transform, batch_size: int = 128,
     implementation detail.
     """
     dataset = ImageFolder(root=root, transform=transform)
+    # ImageFolder numbers the class directories it finds, from 0, so a tree
+    # missing one shifts every label after it and the accuracy below it becomes
+    # meaningless without raising. Every condition is written with all 43 by
+    # construction; this is what keeps that true.
+    assert_canonical_labels(dataset, root)
     generator = None
     if shuffle and seed is not None:
         generator = torch.Generator()
