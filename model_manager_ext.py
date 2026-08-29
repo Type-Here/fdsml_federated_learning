@@ -22,9 +22,11 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from torchvision import transforms
 from torchvision.datasets import ImageFolder
 
 import fipa
+from augmentation import AugmentationSpec, augmentation_spec
 from class_mapping import remap_imagefolder_targets
 from model_manager import ModelManager
 
@@ -64,14 +66,68 @@ class ExtendedModelManager(ModelManager):
     """
 
     def __init__(self, config: dict, dataset_path: str):
-        # Set before super().__init__ so that a base class which ever builds a
-        # loader while constructing still finds it.
+        # Both set before super().__init__ so that a base class which ever builds
+        # a loader while constructing still finds them.
         self._shuffle_generator = torch.Generator()
         self._shuffle_generator.manual_seed(shuffle_seed(config, dataset_path))
+        self._augmentation = augmentation_spec(config)
+        self._augmented_pipeline = None
         super().__init__(config, dataset_path)
+        self._augmented_pipeline = self._build_augmented_pipeline()
 
-    def _get_dataloader(self, split: str, batch_size: int) -> DataLoader:
+    def _build_augmented_pipeline(self):
+        """The evaluation pipeline with one `RandomAffine` inserted after the resize.
+
+        Returns None when augmentation is off, which is the default - so a
+        configuration that does not ask for it gets the received pipeline,
+        object for object.
+
+        **The evaluation pipeline is never touched.** That is what keeps the
+        corrupted test set comparable with training: those images are read
+        through `_get_transforms()` exactly as before, and only the training
+        loader sees anything extra. See `augmentation.py` for which
+        transformations are allowed and which are refused outright.
+
+        The affine goes *after* the resize, so it acts at the working
+        resolution rather than on a source image that may be under 32 pixels
+        wid. In this way the amount of geometry is the same for every image
+        regardless of how large the original was.
+
+        One honest limitation: `RandomAffine` draws from the **global** Torch
+        RNG, like the head initiali<ation does, and the clients of a run are
+        concurrent threads in one process - so this adds to the existing source
+        of run-to-run variation rather than being reproducible on its own.
+        """
+        if self._augmentation is None:
+            return None
+
+        spec: AugmentationSpec = self._augmentation
+        base = list(self.transform_pipeline.transforms)
+        if not base or not isinstance(base[0], transforms.Resize):
+            raise RuntimeError(
+                f"expected the transform pipeline to begin with a Resize, found "
+                f"{type(base[0]).__name__ if base else 'an empty pipeline'}. The "
+                f"affine has to act on a PIL image at the working resolution: "
+                f"placed after ToTensor and Normalize it would still run, and "
+                f"would fill the corners it creates with mid-grey instead of "
+                f"black, silently.")
+
+        affine = transforms.RandomAffine(
+            degrees=spec.degrees,
+            translate=(spec.translate, spec.translate),
+            scale=spec.scale,
+        )
+        return transforms.Compose([base[0], affine] + base[1:])
+
+    def _get_dataloader(self, split: str, batch_size: int,
+                        augment: Optional[bool] = None) -> DataLoader:
         """The base loader, with canonical labels and a private shuffle RNG.
+
+        **Augmentation.** `augment=None`, the default, means "augment if this is
+        the training split and the configuration asked for it", which is what
+        every caller in the received code wants. `augment=False` forces the
+        evaluation pipeline onto the training split; `collect_gradient_factors`
+        uses it, and the reason is in that method.
 
         **The labels.** `ImageFolder` numbers the class subdirectories it finds,
         alphabetically, from 0 - and a client's split holds only the classes it
@@ -101,16 +157,23 @@ class ExtendedModelManager(ModelManager):
         it, deterministically, and no other client can disturb it.
 
         This does not make a run bit-reproducible on its own. The classifier
-        head is still initialised from the global RNG inside the base
+        head is still initialized from the global RNG inside the base
         constructor, in those same concurrent threads, and with a frozen
-        pre-trained backbone that head is the only randomly initialised thing in
+        pre-trained backbone that head is the only randomly initialized thing in
         the model - so it remains the larger source. Removing it was a
         deliberate decision to leave the received training scheme alone.
         """
         data_path = os.path.join(self.dataset_path, split)
         if not os.path.isdir(data_path):
             raise FileNotFoundError(f"Dataset directory not found for split '{split}': {data_path}")
-        dataset = ImageFolder(root=data_path, transform=self.transform_pipeline)
+
+        if augment is None:
+            augment = (split == 'train')
+        pipeline = (self._augmented_pipeline
+                    if augment and self._augmented_pipeline is not None
+                    else self.transform_pipeline)
+
+        dataset = ImageFolder(root=data_path, transform=pipeline)
         remap_imagefolder_targets(dataset, self.config['dataset_path'])
         if split != 'train':
             return DataLoader(dataset, batch_size=batch_size, shuffle=False)
@@ -159,6 +222,17 @@ class ExtendedModelManager(ModelManager):
            towards the global model and constrains them for a reason that has
            nothing to do with this client's data.
 
+        4. **The un-augmented loader**, when training augmentation is on. The
+           argument cuts both ways and the choice is deliberate: the Fisher
+           information could be said to belong to the distribution actually
+           trained on, augmentation included. But `RandomAffine` resamples on
+           every pass, so `G` - and with it the reported explained variance -
+           would become a different random quantity each round, on top of a
+           low-rank estimate that is already noisy. The clean training set is
+           the fixed reference the same run can be compared against twice, and
+           it keeps this run's explained variance comparable with the values
+           measured before augmentation existed.
+
         Cost: one extra forward+backward pass over (a prefix of) the local
         training set, per FIPA round. `max_batches` is the dial - and note the
         honesty caveat, which belongs in the report: PyTorch hands back the mean
@@ -201,7 +275,7 @@ class ExtendedModelManager(ModelManager):
                 silently contributes nothing.
         """
         parameters = self._get_trainable_parameters()
-        loader = self._get_dataloader('train', batch_size)
+        loader = self._get_dataloader('train', batch_size, augment=False)
 
         # eval(): no dropout, and no BatchNorm buffer drift. See point 1 above.
         was_training = self.model.training
