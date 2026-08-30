@@ -53,12 +53,19 @@ exists, and the mismatch compounds with depth.
           -> [l1.0.bn2] worse              ...and this one moved more
 
 That is one Jacobi step away from the old statistics, not a fixed point. The way
-out used here is `self_consistent=True` on `collect_bn_state`: the measuring pass
-runs with the BatchNorm layers in **batch-statistics mode**, so each layer's
-input is already produced by upstream layers normalizing on the current data,
-which is the regime the finished state will be used in. The accumulation stays
-the raw-moment one, so the pooled variance is still exact - the only thing that
-changes is the distribution the moments are taken over.
+out is `collect_bn_state(..., method='sequential')`: measure one layer, write it,
+move to the next, so every layer is measured with everything upstream already at
+its final value. Exact by construction, and the argument is in `_sweep_bn_state`.
+`method='batch-stats'` is the cheaper approximation - one pass with the layers
+normalizing on the batch in hand - which lands about 38x closer than doing
+nothing and is still not a fixed point, because during that pass the upstream
+layers use per-batch statistics while the finished state uses pooled ones, and
+the gap accumulates with depth. Iterating it does not help: it converges to the
+batch-statistics fixed point, which is not the one `eval()` runs on.
+
+The accumulation is the raw-moment one throughout, so the pooled variance is
+always exact; what the three methods differ in is the distribution the moments
+are taken over.
 
 `state_residual` / `assert_state_is_fixed_point` are the invariant that catches
 it: load a state, measure again, and require it not to move. `self_check` cannot
@@ -81,7 +88,7 @@ __all__ = [
     'bn_modules', 'descriptor_layer_names', 'collect_bn_state',
     'load_bn_state', 'current_bn_state', 'build_bank', 'self_check',
     'restrict_state', 'check_descriptor_independence', 'DescriptorProbe',
-    'state_residual', 'assert_state_is_fixed_point',
+    'state_residual', 'assert_state_is_fixed_point', 'COLLECT_METHODS',
 ]
 
 # Which layers the descriptor is read from: the early stages only. They respond
@@ -194,6 +201,16 @@ def restrict_state(state: BNState, names: Sequence[str]) -> BNState:
     return {name: state[name] for name in names}
 
 
+class _StopForward(Exception):
+    """The pass has what it was after; there is no reason to finish the network.
+
+    Raised out of a hook and caught by the collection loop. Only used when the
+    layers being measured are a prefix of the network - measuring `bn1` means
+    running `conv1` and stopping, not running all of ResNet18 - which is what
+    makes the layer-by-layer sweep affordable.
+    """
+
+
 class _InputMoments:
     """Raw per-channel moments of what each BatchNorm layer is fed.
 
@@ -203,9 +220,13 @@ class _InputMoments:
     oscillate between identical batches, and nothing would raise.
     """
 
-    def __init__(self, model: nn.Module, names: Optional[Sequence[str]] = None):
+    def __init__(self, model: nn.Module, names: Optional[Sequence[str]] = None,
+                 stop_when_complete: bool = False):
         modules = bn_modules(model)
         self.names = list(names) if names is not None else list(modules)
+        self.stop_when_complete = stop_when_complete
+        self._wanted = set(self.names)
+        self._seen_this_batch: set = set()
         self._handles = []
         self._count: Dict[str, float] = {}
         self._sum: Dict[str, torch.Tensor] = {}
@@ -215,6 +236,10 @@ class _InputMoments:
             module = modules[name]
             self._handles.append(
                 module.register_forward_pre_hook(self._make_hook(name)))
+
+    def begin_batch(self) -> None:
+        """Tell the early exit that a new forward is starting."""
+        self._seen_this_batch = set()
 
     def _make_hook(self, name: str):
         def hook(_module, inputs):
@@ -232,6 +257,10 @@ class _InputMoments:
                 self._sum[name] = total
                 self._sum_sq[name] = total_sq
                 self._count[name] = n
+            if self.stop_when_complete:
+                self._seen_this_batch.add(name)
+                if self._wanted <= self._seen_this_batch:
+                    raise _StopForward
         return hook
 
     def remove(self) -> None:
@@ -333,42 +362,83 @@ def _batch_statistics(model: nn.Module, enabled: bool = True):
         load_bn_state(model, saved)
 
 
+COLLECT_METHODS: Tuple[str, ...] = ('as-is', 'batch-stats', 'sequential')
+
+
 @torch.no_grad()
 def collect_bn_state(model: nn.Module, loader, device: torch.device,
                      names: Optional[Sequence[str]] = None,
                      max_batches: Optional[int] = None,
-                     self_consistent: bool = False) -> BNState:
-    """One forward pass over `loader`, returning the statistics it produced.
+                     method: str = 'as-is',
+                     progress=None) -> BNState:
+    """Measure what each BatchNorm layer is fed, and return it as a state.
 
     Dropout is off throughout - train mode would make each forward a different
     random function - and the model's own buffers are left as they were found.
 
+    **Three methods, and the choice is a correctness one.** The difficulty is
+    that the twenty layers are not twenty independent measurements: each one's
+    input is produced by the layers above it, which are normalising with
+    whatever is loaded at the time. See the module docstring for what that
+    breaks.
+
+        'as-is'        One pass, everything measured under the statistics the
+                       model is carrying now. Correct only for layers fed by
+                       frozen modules - `bn1`, whose input is `conv1`'s output.
+                       This is the right choice for a **descriptor**, and it is
+                       the default for that reason. Using it for a state that
+                       gets loaded is the bug this module's docstring is about.
+
+        'batch-stats'  One pass with the layers normalising on the batch in
+                       hand, so each input is produced by upstream layers
+                       already adapted to this data. Gets close - measured on a
+                       ResNet18, it takes the residual from ~8.8 sigma to ~0.23
+                       - but it is not exact: during the pass the upstream
+                       layers use *per-batch* statistics while the finished
+                       state uses *pooled* ones, and that gap accumulates with
+                       depth. It converges to the batch-statistics fixed point,
+                       which is not the one eval() runs on, so **iterating it
+                       does not help**.
+
+        'sequential'   Exact, by construction. One layer at a time in execution
+                       order: measure it, write it, move on - so each layer is
+                       measured with everything upstream already at its final
+                       value, and nothing downstream can affect it. Costs one
+                       pass per layer, but each pass stops as soon as the layer
+                       it wants has been seen, so twenty layers cost about ten
+                       full passes rather than twenty. **The right choice for
+                       any state that gets loaded into the model.**
+
     Args:
         model: the network, already on `device`.
         loader: yields `(images, labels)`; the labels are ignored, because this
-            stage has none to use.
-        device: where to run .
+            stage has none to use. Must be re-iterable for 'sequential'.
+        device: where to run.
         names: which BN layers to record. None records all of them, which is
             what a bank state needs; a descriptor uses a subset.
-        max_batches: stop early, for a smoke check.
-        self_consistent: measure with the BatchNorm layers normalizing on the
-            current batch, so that every layer's input is produced by upstream
-            layers already adapted to this data rather than by the statistics
-            being replaced. **Required for any state that will be loaded back
-            into the model** - see the module docstring. Not required, and not
-            wanted, for a descriptor read from `bn1`: that layer is fed by the
-            frozen `conv1`, so its input is the same either way, and leaving it
-            False keeps the bank's descriptors comparable with the runtime ones
-            by construction.
+        max_batches: stop early, for a smoke check. Under 'sequential' the
+            batches are snapshotted once and reused for every layer - a shuffled
+            loader reshuffles on each pass, and layers measured on different
+            subsets would not be a fixed point of anything.
+        method: one of `COLLECT_METHODS`, above.
+        progress: optional `f(done, total, layer_name)`, called by 'sequential'
+            after each layer - it is the one method slow enough to want it.
 
     Returns:
         `{layer name: (mean, var)}` as numpy arrays.
     """
+    if method not in COLLECT_METHODS:
+        raise ValueError(f"unknown method {method!r}, expected one of "
+                         f"{list(COLLECT_METHODS)}")
+    if method == 'sequential':
+        return _sweep_bn_state(model, loader, device, names=names,
+                               max_batches=max_batches, progress=progress)
+
     was_training = model.training
     model.eval()
     moments = _InputMoments(model, names)
     try:
-        with _batch_statistics(model, enabled=self_consistent):
+        with _batch_statistics(model, enabled=(method == 'batch-stats')):
             for index, batch in enumerate(loader):
                 if max_batches is not None and index >= max_batches:
                     break
@@ -378,6 +448,89 @@ def collect_bn_state(model: nn.Module, loader, device: torch.device,
         moments.remove()
         model.train(was_training)
     return moments.state()
+
+
+@torch.no_grad()
+def _one_layer_moments(model: nn.Module, name: str, loader,
+                       device: torch.device,
+                       max_batches: Optional[int] = None) -> BNState:
+    """One layer's input moments, running only as much of the network as needed.
+
+    The hook raises `_StopForward` the moment it has recorded the batch, so a
+    measurement of `bn1` costs `conv1` and nothing else. That is what makes a
+    twenty-layer sweep cost about ten full passes instead of twenty.
+    """
+    was_training = model.training
+    model.eval()
+    moments = _InputMoments(model, [name], stop_when_complete=True)
+    try:
+        for index, batch in enumerate(loader):
+            if max_batches is not None and index >= max_batches:
+                break
+            images = batch[0] if isinstance(batch, (tuple, list)) else batch
+            moments.begin_batch()
+            try:
+                model(images.to(device, non_blocking=True))
+            except _StopForward:
+                pass
+    finally:
+        moments.remove()
+        model.train(was_training)
+    return moments.state()
+
+
+def _sweep_bn_state(model: nn.Module, loader, device: torch.device,
+                    names: Optional[Sequence[str]] = None,
+                    max_batches: Optional[int] = None,
+                    progress=None) -> BNState:
+    """The exact fixed point: one layer at a time, in execution order.
+
+    Why this is exact where one simultaneous pass is not. A layer's input
+    depends on the layers **above** it and on nothing else - not on its own
+    statistics, not on anything downstream. So if every upstream layer already
+    carries its final value when the layer is measured, that measurement is the
+    one the finished network will reproduce, and it stays true as the sweep
+    continues past it. After one sweep every layer satisfies that, which is what
+    "fixed point" means. Loading the whole set changes nothing, and
+    `state_residual` comes back at float noise.
+
+    `named_modules` order is used, which for a ResNet is execution order. A
+    downsample branch is the one place it is not, and it is harmless: that
+    branch is *parallel* to the two convolutions beside it and its input is the
+    block's input, which is upstream of all three and finalised before any of
+    them. Nothing in the block depends on the order the three are visited in.
+
+    The model's buffers are restored on exit; the caller decides whether to
+    apply the result.
+    """
+    modules = bn_modules(model)
+    wanted = list(modules) if names is None else [n for n in modules if n in set(names)]
+    unknown = [n for n in (names or []) if n not in modules]
+    if unknown:
+        raise KeyError(f"not BatchNorm layers of this model: {unknown}")
+
+    if max_batches is not None:
+        # Every layer must see the SAME data, or the sweep is a fixed point of
+        # nothing. A shuffled loader reshuffles on each pass, so with a cut-off
+        # the layers would each get a different subset. Snapshot once instead;
+        # it is a smoke-sized number of batches by construction.
+        loader = [batch for _, batch in zip(range(max_batches), loader)]
+        max_batches = None
+
+    saved = current_bn_state(model)
+    result: BNState = {}
+    try:
+        for position, name in enumerate(wanted):
+            measured = _one_layer_moments(model, name, loader, device,
+                                          max_batches=max_batches)
+            result[name] = measured[name]
+            # Commit before measuring the next one - that is the whole method.
+            load_bn_state(model, {name: measured[name]})
+            if progress is not None:
+                progress(position + 1, len(wanted), name)
+    finally:
+        load_bn_state(model, saved)
+    return result
 
 
 def current_bn_state(model: nn.Module) -> BNState:
@@ -505,14 +658,15 @@ def assert_state_is_fixed_point(model: nn.Module, state: BNState, loader,
             f"{worst['mean_shift']:.3f} sigma (tolerance {mean_tolerance}) and "
             f"the variance of '{worst['var_layer']}' by "
             f"{worst['var_ratio'] * 100:.1f}% (tolerance {var_tolerance * 100:.0f}%). "
-            f"It was almost certainly collected without self_consistent=True, in "
-            f"which case every layer below the first describes an input "
+            f"Collect it with method='sequential', which measures one layer at "
+            f"a time with everything upstream already final; anything else "
+            f"leaves every layer below the first describing an input "
             f"distribution that no longer exists")
     return worst
 
 
 class BankEntry:
-    """One known condition: what to load, and how to recognise it."""
+    """One known condition: what to load, and how to recognize it."""
 
     __slots__ = ('label', 'state', 'descriptor')
 
@@ -530,7 +684,8 @@ def build_bank(model: nn.Module, loaders: "OrderedDict[str, object]",
                descriptor_prefixes: Sequence[str] = DEFAULT_DESCRIPTOR_PREFIXES,
                calibration_batches: int = 8,
                max_batches: Optional[int] = None,
-               self_consistent: bool = True
+               method: str = 'sequential',
+               progress=None
                ) -> Tuple[List[BankEntry], List[float]]:
     """Build one entry per condition, plus the distances to calibrate on.
 
@@ -550,10 +705,13 @@ def build_bank(model: nn.Module, loaders: "OrderedDict[str, object]",
             built from two batches describes two batches, and the threshold
             calibrated beside it is meaningless. Never set it for a bank that
             will produce a number.
-        self_consistent: how the entry states are measured. True is the only
-            correct setting for states that get loaded back into the model - see
-            the module docstring. False exists to reproduce the earlier
-            behaviour and show what it costs.
+        method: how the entry states are measured. 'sequential' is the only
+            exact setting for a state that gets loaded back into the model - see
+            `collect_bn_state`. 'batch-stats' is a cheaper approximation and
+            'as-is' reproduces the earlier, broken behavior; both remain
+            reachable so the difference can be measured rather than asserted.
+        progress: optional `f(done, total, layer)`, passed to each condition's
+            sweep - the slow part of a bank build.
 
     Returns:
         `(entries, intra_distances)`.
@@ -569,7 +727,7 @@ def build_bank(model: nn.Module, loaders: "OrderedDict[str, object]",
 
     for label, loader in loaders.items():
         state = collect_bn_state(model, loader, device, max_batches=max_batches,
-                                 self_consistent=self_consistent)
+                                 method=method, progress=progress)
         descriptor = descriptor_from_state(state, layer_names, label)
         entries.append(BankEntry(label, state, descriptor))
 
@@ -577,10 +735,10 @@ def build_bank(model: nn.Module, loaders: "OrderedDict[str, object]",
         # One batch is exactly what the router will see at runtime, so this
         # measures the right thing rather than a smoothed version of it.
         #
-        # Deliberately NOT self-consistent, and for the same reason the runtime
-        # descriptor is not: these layers are `bn1`, fed by the frozen `conv1`,
-        # so the mode changes nothing here - and reading them exactly as the
-        # stream will read them is what keeps the two comparable.
+        # Deliberately 'as-is', for the same reason the runtime descriptor is:
+        # these layers are `bn1`, fed by the frozen `conv1`, so no method
+        # changes their numbers - and reading them exactly the way the stream
+        # reads them is what keeps the two comparable.
         for index, batch in enumerate(loader):
             if index >= calibration_batches:
                 break
