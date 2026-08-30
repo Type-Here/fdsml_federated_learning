@@ -79,7 +79,8 @@ from torch.utils.data import DataLoader
 from torchvision.datasets import ImageFolder
 
 from class_mapping import assert_canonical_labels
-from iot.bn_bank import bn_modules, collect_bn_state, load_bn_state
+from iot.bn_bank import (assert_state_is_fixed_point, bn_modules,
+                         collect_bn_state, load_bn_state)
 from iot.routing import BNState
 
 __all__ = [
@@ -165,10 +166,16 @@ def image_folder_loader(root: str, transform, batch_size: int = 128,
     Every condition of GTSRB-C is written as its own `ImageFolder` tree exactly
     so that this is all the loading code the inference half needs.
 
-    `shuffle` is False by default: a stream is evaluated in a fixed order so two
-    runs produce the same table, and the routing decision on batch *i* depends on
-    batch *i-1*, which makes the order part of the experiment rather than an
-    implementation detail.
+    `shuffle` is False by default, but a `seed` makes a shuffled loader just as
+    reproducible - the sampler draws from a `torch.Generator` seeded here - and
+    that is what the stream uses. The distinction matters: `ImageFolder` walks
+    the class directories in order, so an unshuffled batch of 128 out of a
+    2000-image condition holds two or three of the 43 sign types. Blind BN-adapt
+    estimates its statistics from exactly that batch, and the routing descriptor
+    is supposed to describe the degradation rather than which sign is in frame,
+    so both are better served by a mixed batch. Either way the order is fixed
+    before the run starts, which is what the protocol needs: the routing decision
+    on batch *i* depends on batch *i-1*.
     """
     dataset = ImageFolder(root=root, transform=transform)
     # ImageFolder numbers the class directories it finds, from 0, so a tree
@@ -201,7 +208,8 @@ def bn_stats_from_checkpoint(metadata: Dict) -> Optional[BNState]:
 @torch.no_grad()
 def recalibrate(model, loader, device: torch.device,
                 max_batches: Optional[int] = None,
-                apply: bool = True) -> BNState:
+                apply: bool = True,
+                self_consistent: bool = True) -> BNState:
     """Replace the model's ImageNet statistics with GTSRB's, from clean data.
 
     One forward pass, `eval()` throughout, over **every** BatchNorm layer - not
@@ -214,6 +222,14 @@ def recalibrate(model, loader, device: torch.device,
     underestimate by exactly the between-batch term - the same identity the
     federated version needs, avoided here by never forming a per-batch variance.
 
+    **The pass runs with the layers normalizing on the batch in hand**
+    (`self_consistent=True`). The twenty layers are not twenty independent
+    measurements: each one's input is the previous one's output, so measuring
+    them all while the model still carries ImageNet's numbers gives every layer
+    below the first a description of an input distribution that stops existing
+    the moment the state is loaded. `bn_bank`'s module docstring has the full
+    argument, and `assert_state_is_fixed_point` is the check that enforces it.
+
     Args:
         model: the rebuilt network, on `device`.
         loader: clean GTSRB training images. Labels are ignored; there are none
@@ -222,12 +238,16 @@ def recalibrate(model, loader, device: torch.device,
         max_batches: stop early. For a smoke check only - a partial pass gives a
             partial state and the whole point is that it describes the data.
         apply: write the result into the model's buffers as well as returning it.
+        self_consistent: measure with the BatchNorm layers on batch statistics,
+            so that the state describes the network it is about to become.
+            False reproduces the earlier, incorrect behavior.
 
     Returns:
         The full `{layer: (mean, var)}` state.
     """
     state = collect_bn_state(model, loader, device, names=None,
-                             max_batches=max_batches)
+                             max_batches=max_batches,
+                             self_consistent=self_consistent)
     if apply:
         load_bn_state(model, state)
     return state
@@ -239,7 +259,7 @@ def save_recalibrated(checkpoint: Dict, state: BNState, path: str,
                       num_images: Optional[int] = None) -> str:
     """Write a second checkpoint carrying the statistics, and saying so.
 
-    A separate file rather than an edit in place: the original is the artefact
+    A separate file rather than an edit in place: the original is the artifact
     Part A produced and the two are worth being able to compare, since "how much
     did the recalibration alone buy on clean images" is one of the numbers the
     write-up needs.
@@ -300,6 +320,12 @@ def main(argv=None) -> int:
                         help="output path; defaults to <checkpoint>_bn.pkl")
     parser.add_argument('--batch-size', type=int, default=128)
     parser.add_argument('--num-workers', type=int, default=2)
+    parser.add_argument('--seed', type=int, default=42,
+                        help="fixes the order of the pass, which is shuffled: "
+                             "the pooled moments do not care, but the layers "
+                             "normalise on the batch in hand while they are "
+                             "measured, and a class-ordered batch is a poor "
+                             "sample to normalise on")
     parser.add_argument('--device', default=None)
     args = parser.parse_args(argv)
 
@@ -312,12 +338,24 @@ def main(argv=None) -> int:
     model, manager = build_model(checkpoint['metadata'], checkpoint['weights'],
                                  device=args.device)
     loader = image_folder_loader(args.data, manager.transform_pipeline,
-                                 args.batch_size, num_workers=args.num_workers)
+                                 args.batch_size, shuffle=True,
+                                 num_workers=args.num_workers, seed=args.seed)
     num_images = len(loader.dataset)
 
     started = time.time()
     state = recalibrate(model, loader, manager.device)
     elapsed = time.time() - started
+
+    # One extra pass, and it is the one that would have caught a whole void run:
+    # load what was just measured, measure again in plain eval(), and require the
+    # statistics not to move. A state that does move describes a network other
+    # than the one carrying it, and the model classifies at chance without
+    # anything raising.
+    residual = assert_state_is_fixed_point(model, state, loader, manager.device)
+    print(f"fixed point: input mean moves at most "
+          f"{residual['mean_shift']:.4f} sigma ('{residual['mean_layer']}'), "
+          f"variance at most {residual['var_ratio'] * 100:.2f}% "
+          f"('{residual['var_layer']}')")
 
     out = args.out or (os.path.splitext(args.checkpoint)[0] + '_bn.pkl')
     path = save_recalibrated(checkpoint, state, out,

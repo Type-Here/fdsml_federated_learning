@@ -72,6 +72,7 @@ from iot.bn_adapt import adapt_batchnorm
 from iot.bn_bank import (
     DescriptorProbe,
     build_bank,
+    state_residual,
     check_descriptor_independence,
     current_bn_state,
     descriptor_layer_names,
@@ -206,6 +207,7 @@ def build_bank_from_disk(model, transform, root: str,
                          batch_size: int = 128, num_workers: int = 2,
                          max_batches_per_condition: Optional[int] = None,
                          percentile: float = 95.0,
+                         shuffle: bool = True, seed: int = 42,
                          device: Optional[torch.device] = None):
     """One state per known corruption, plus the threshold, from GTSRB-C on disk.
 
@@ -220,13 +222,22 @@ def build_bank_from_disk(model, transform, root: str,
     instead of a constant: *if you are further away than 95% of batches are from
     their own corruption, I do not recognise you.*
 
+    The loaders are **shuffled**, with a fixed seed, for the same reason the
+    stream is. The pooled state does not care - it sees every image either way -
+    but the intra-condition distances that set the threshold are measured on
+    single batches, and `ImageFolder` walks the class directories in order, so
+    an unshuffled batch of 128 holds two or three sign types out of 43. A
+    threshold calibrated on class-homogeneous batches does not describe the
+    class-mixed batches the router is then asked to judge.
+
     Returns:
         `(entries, threshold, intra_distances)`.
     """
     device = device or next(model.parameters()).device
     loaders: "OrderedDict[str, object]" = OrderedDict()
     loaders[CLEAN_CONDITION] = image_folder_loader(
-        os.path.join(root, CLEAN_CONDITION), transform, batch_size, num_workers=num_workers)
+        os.path.join(root, CLEAN_CONDITION), transform, batch_size,
+        shuffle=shuffle, num_workers=num_workers, seed=seed)
     for corruption in corruptions:
         directory = os.path.join(root, condition_name(corruption, severity))
         if not os.path.isdir(directory):
@@ -234,7 +245,8 @@ def build_bank_from_disk(model, transform, root: str,
                 f"{directory} does not exist; generate GTSRB-C first with "
                 f"`python -m iot.gtsrb_c`")
         loaders[corruption] = image_folder_loader(
-            directory, transform, batch_size, num_workers=num_workers)
+            directory, transform, batch_size, shuffle=shuffle,
+            num_workers=num_workers, seed=seed)
 
     entries, intra = build_bank(model, loaders, device,
                                 descriptor_prefixes=ONE_PASS_DESCRIPTOR_PREFIXES,
@@ -531,19 +543,29 @@ def evaluate(checkpoint_path: str, gtsrb_c_root: str, output_dir: str,
              revisit_clean: bool = True,
              recalibrate_on: Optional[str] = None,
              num_workers: int = 2,
+             shuffle_stream: bool = True,
+             seed: int = 42,
              max_batches_per_condition: Optional[int] = None,
              device: Optional[str] = None) -> Dict:
     """The whole experiment: build the bank, run every arm, write the tables.
 
     Writes `conditions.csv` (one row per arm per condition), `batches.csv` (one
-    row per batch, which is what the routing behaviour has to be read from) and
+    row per batch, which is what the routing behavior has to be read from) and
     `summary.json` (the bank, the threshold, the efficiency budget).
 
     `recalibrate_on` is the clean training set. If the checkpoint does not
     already carry GTSRB statistics and this is not given, the run still happens
-    but every arm starts from an ImageNet-normalised backbone, and the numbers
+    but every arm starts from an ImageNet-normalized backbone, and the numbers
     then mix "we fixed ImageNet -> GTSRB" with "we fixed clean -> corrupted".
     The summary records which of the two situations produced it.
+
+    `shuffle_stream` is on, with a fixed `seed`, so the run stays reproducible
+    while each batch is a mixed sample of the 43 classes. Unshuffled,
+    `ImageFolder` hands out the class directories in order and a 128-image batch
+    covers two or three sign types - which handicaps blind BN-adapt, whose whole
+    estimate is that batch, and puts semantics into a descriptor whose job is to
+    describe the degradation. The protocol is unchanged either way: batch *i-1*
+    still decides for batch *i*.
     """
     checkpoint = load_checkpoint(checkpoint_path)
     metadata = checkpoint['metadata']
@@ -555,24 +577,44 @@ def evaluate(checkpoint_path: str, gtsrb_c_root: str, output_dir: str,
     # 1. The normalisation the whole comparison starts from.
     bn_source = metadata.get('bn_stats_source', 'imagenet')
     carried = bn_stats_from_checkpoint(metadata)
+    clean_loader = None
+    if recalibrate_on:
+        clean_loader = image_folder_loader(recalibrate_on, transform, batch_size,
+                                           shuffle=shuffle_stream,
+                                           num_workers=num_workers, seed=seed)
     if carried is not None:
         load_bn_state(model, carried)
-    elif recalibrate_on:
-        loader = image_folder_loader(recalibrate_on, transform, batch_size,
-                                     num_workers=num_workers)
-        recalibrate(model, loader, torch_device,
+    elif clean_loader is not None:
+        recalibrate(model, loader=clean_loader, device=torch_device,
                     max_batches=max_batches_per_condition)
         bn_source = 'gtsrb-train-pooled (this run)'
         if max_batches_per_condition is not None:
             bn_source += f' - PARTIAL, {max_batches_per_condition} batches only'
     source_state = current_bn_state(model)
 
+    # Is the state the whole comparison starts from a fixed point of the model
+    # carrying it? One extra pass answers it, and the answer belongs in the
+    # summary rather than in somebody's memory: a state that moves when it is
+    # loaded describes a different network, and every arm built on it then
+    # classifies at chance without anything raising. Reported, not enforced -
+    # ImageNet's statistics legitimately move on GTSRB data, and that number is
+    # itself the size of the shift the recalibration exists to remove.
+    fixed_point = None
+    if clean_loader is not None:
+        fixed_point = state_residual(model, source_state, clean_loader,
+                                     torch_device,
+                                     max_batches=max_batches_per_condition)
+        print(f"  starting statistics ({bn_source}): input mean moves "
+              f"{fixed_point['mean_shift']:.4f} sigma, variance "
+              f"{fixed_point['var_ratio'] * 100:.2f}%")
+
     # 2. The bank, and the threshold read off its own intra-condition spread.
     entries, threshold, intra = build_bank_from_disk(
         model, transform, gtsrb_c_root, severity=bank_severity,
         batch_size=batch_size, num_workers=num_workers,
         max_batches_per_condition=max_batches_per_condition,
-        percentile=percentile, device=torch_device)
+        percentile=percentile, shuffle=shuffle_stream, seed=seed,
+        device=torch_device)
     load_bn_state(model, source_state)
     bank_labels = [entry.label for entry in entries]
 
@@ -586,11 +628,11 @@ def evaluate(checkpoint_path: str, gtsrb_c_root: str, output_dir: str,
     for condition in ordered:
         conditions[condition] = image_folder_loader(
             os.path.join(gtsrb_c_root, condition), transform, batch_size,
-            num_workers=num_workers)
+            shuffle=shuffle_stream, num_workers=num_workers, seed=seed)
     if revisit_clean:
         conditions[CLEAN_CONDITION + REVISIT_SUFFIX] = image_folder_loader(
             os.path.join(gtsrb_c_root, CLEAN_CONDITION), transform, batch_size,
-            num_workers=num_workers)
+            shuffle=shuffle_stream, num_workers=num_workers, seed=seed)
 
     distance = symmetric_kl if distance_name == 'symmetric_kl' else l2_distance
 
@@ -626,10 +668,13 @@ def evaluate(checkpoint_path: str, gtsrb_c_root: str, output_dir: str,
         'checkpoint': checkpoint_path,
         'checkpoint_metadata': {k: v for k, v in metadata.items() if k != 'bn_stats'},
         'bn_stats_source': bn_source,
+        'bn_fixed_point': fixed_point,
         'gtsrb_c_root': gtsrb_c_root,
         'arms': list(arms),
         'batch_size': batch_size,
         'severities': list(severities),
+        'shuffle_stream': shuffle_stream,
+        'seed': seed,
         'bank': {
             'labels': bank_labels,
             'severity': bank_severity,
@@ -693,6 +738,15 @@ def main(argv=None) -> int:
                              "every branch in minutes, and every number it "
                              "produces is meaningless")
     parser.add_argument('--num-workers', type=int, default=2)
+    parser.add_argument('--seed', type=int, default=42,
+                        help="fixes the stream order, so a shuffled run is "
+                             "still reproducible batch for batch")
+    parser.add_argument('--no-shuffle', action='store_true',
+                        help="visit the images in ImageFolder order, i.e. class "
+                             "by class. A batch then holds two or three of the "
+                             "43 sign types, which handicaps blind BN-adapt and "
+                             "puts semantics in the routing descriptor - a "
+                             "stress case worth reporting, not the default")
     parser.add_argument('--device', default=None)
     args = parser.parse_args(argv)
 
@@ -704,9 +758,15 @@ def main(argv=None) -> int:
         alpha=args.alpha, percentile=args.percentile,
         revisit_clean=not args.no_revisit_clean,
         recalibrate_on=args.recalibrate_on, num_workers=args.num_workers,
+        shuffle_stream=not args.no_shuffle, seed=args.seed,
         max_batches_per_condition=args.max_batches, device=args.device)
 
     print(f"\nBN statistics: {summary['bn_stats_source']}")
+    if summary.get('bn_fixed_point'):
+        residual = summary['bn_fixed_point']
+        print(f"  fixed point: mean {residual['mean_shift']:.4f} sigma, "
+              f"variance {residual['var_ratio'] * 100:.2f}% - a large residual "
+              f"means the states describe a different network")
     print(f"Bank: {len(summary['bank']['labels'])} states, "
           f"{summary['bank']['footprint']['total_kilobytes']:.0f} KB, "
           f"threshold {summary['bank']['threshold']:.4g}")
