@@ -209,7 +209,8 @@ def bn_stats_from_checkpoint(metadata: Dict) -> Optional[BNState]:
 def recalibrate(model, loader, device: torch.device,
                 max_batches: Optional[int] = None,
                 apply: bool = True,
-                self_consistent: bool = True) -> BNState:
+                method: str = 'sequential',
+                progress=None) -> BNState:
     """Replace the model's ImageNet statistics with GTSRB's, from clean data.
 
     One forward pass, `eval()` throughout, over **every** BatchNorm layer - not
@@ -222,13 +223,20 @@ def recalibrate(model, loader, device: torch.device,
     underestimate by exactly the between-batch term - the same identity the
     federated version needs, avoided here by never forming a per-batch variance.
 
-    **The pass runs with the layers normalizing on the batch in hand**
-    (`self_consistent=True`). The twenty layers are not twenty independent
-    measurements: each one's input is the previous one's output, so measuring
-    them all while the model still carries ImageNet's numbers gives every layer
-    below the first a description of an input distribution that stops existing
-    the moment the state is loaded. `bn_bank`'s module docstring has the full
-    argument, and `assert_state_is_fixed_point` is the check that enforces it.
+    **The layers are measured one at a time, in execution order**
+    (`method='sequential'`). The twenty of them are not twenty independent
+    measurements: each one's input is produced by the ones above it, so measuring
+    them all at once while the model still carries ImageNet's numbers gives every
+    layer below the first a description of an input distribution that stops
+    existing the moment the state is loaded. Sweeping instead - measure a layer,
+    write it, move on - makes each measurement one the finished network
+    reproduces exactly. `bn_bank`'s module docstring has the argument in full,
+    `_sweep_bn_state` has why the sweep is exact where one pass is not, and
+    `assert_state_is_fixed_point` is the check that enforces it.
+
+    Cost: one pass per layer instead of one in total, but each pass stops as soon
+    as its layer has been seen, so ResNet18's twenty come to roughly ten full
+    passes. Minutes, once, for a file every later experiment then reuses.
 
     Args:
         model: the rebuilt network, on `device`.
@@ -238,16 +246,18 @@ def recalibrate(model, loader, device: torch.device,
         max_batches: stop early. For a smoke check only - a partial pass gives a
             partial state and the whole point is that it describes the data.
         apply: write the result into the model's buffers as well as returning it.
-        self_consistent: measure with the BatchNorm layers on batch statistics,
-            so that the state describes the network it is about to become.
-            False reproduces the earlier, incorrect behavior.
+        method: see `bn_bank.collect_bn_state`. 'sequential' is exact and is the
+            only one that should ever produce a checkpoint; the other two remain
+            reachable so that what they cost can be measured.
+        progress: optional `f(done, total, layer)` - the sweep is the slow step,
+            so it is the one worth reporting.
 
     Returns:
         The full `{layer: (mean, var)}` state.
     """
     state = collect_bn_state(model, loader, device, names=None,
                              max_batches=max_batches,
-                             self_consistent=self_consistent)
+                             method=method, progress=progress)
     if apply:
         load_bn_state(model, state)
     return state
@@ -342,8 +352,11 @@ def main(argv=None) -> int:
                                  num_workers=args.num_workers, seed=args.seed)
     num_images = len(loader.dataset)
 
+    def show(done, total, layer):
+        print(f"  [{done:2d}/{total}] {layer}", flush=True)
+
     started = time.time()
-    state = recalibrate(model, loader, manager.device)
+    state = recalibrate(model, loader, manager.device, progress=show)
     elapsed = time.time() - started
 
     # One extra pass, and it is the one that would have caught a whole void run:

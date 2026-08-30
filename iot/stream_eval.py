@@ -208,6 +208,7 @@ def build_bank_from_disk(model, transform, root: str,
                          max_batches_per_condition: Optional[int] = None,
                          percentile: float = 95.0,
                          shuffle: bool = True, seed: int = 42,
+                         method: str = 'sequential',
                          device: Optional[torch.device] = None):
     """One state per known corruption, plus the threshold, from GTSRB-C on disk.
 
@@ -250,7 +251,8 @@ def build_bank_from_disk(model, transform, root: str,
 
     entries, intra = build_bank(model, loaders, device,
                                 descriptor_prefixes=ONE_PASS_DESCRIPTOR_PREFIXES,
-                                max_batches=max_batches_per_condition)
+                                max_batches=max_batches_per_condition,
+                                method=method)
     return entries, calibrate_threshold(intra, percentile), intra
 
 
@@ -545,6 +547,7 @@ def evaluate(checkpoint_path: str, gtsrb_c_root: str, output_dir: str,
              num_workers: int = 2,
              shuffle_stream: bool = True,
              seed: int = 42,
+             bn_method: str = 'sequential',
              max_batches_per_condition: Optional[int] = None,
              device: Optional[str] = None) -> Dict:
     """The whole experiment: build the bank, run every arm, write the tables.
@@ -586,7 +589,7 @@ def evaluate(checkpoint_path: str, gtsrb_c_root: str, output_dir: str,
         load_bn_state(model, carried)
     elif clean_loader is not None:
         recalibrate(model, loader=clean_loader, device=torch_device,
-                    max_batches=max_batches_per_condition)
+                    max_batches=max_batches_per_condition, method=bn_method)
         bn_source = 'gtsrb-train-pooled (this run)'
         if max_batches_per_condition is not None:
             bn_source += f' - PARTIAL, {max_batches_per_condition} batches only'
@@ -614,7 +617,7 @@ def evaluate(checkpoint_path: str, gtsrb_c_root: str, output_dir: str,
         batch_size=batch_size, num_workers=num_workers,
         max_batches_per_condition=max_batches_per_condition,
         percentile=percentile, shuffle=shuffle_stream, seed=seed,
-        device=torch_device)
+        method=bn_method, device=torch_device)
     load_bn_state(model, source_state)
     bank_labels = [entry.label for entry in entries]
 
@@ -668,6 +671,7 @@ def evaluate(checkpoint_path: str, gtsrb_c_root: str, output_dir: str,
         'checkpoint': checkpoint_path,
         'checkpoint_metadata': {k: v for k, v in metadata.items() if k != 'bn_stats'},
         'bn_stats_source': bn_source,
+        'bn_method': bn_method,
         'bn_fixed_point': fixed_point,
         'gtsrb_c_root': gtsrb_c_root,
         'arms': list(arms),
@@ -747,6 +751,14 @@ def main(argv=None) -> int:
                              "43 sign types, which handicaps blind BN-adapt and "
                              "puts semantics in the routing descriptor - a "
                              "stress case worth reporting, not the default")
+    parser.add_argument('--bn-method', default='sequential',
+                        choices=['sequential', 'batch-stats', 'as-is'],
+                        help="how the bank states and the recalibration are "
+                             "measured. 'sequential' is exact - one layer at a "
+                             "time, each measured with everything upstream "
+                             "already final. The other two are there to "
+                             "reproduce what they cost and should not produce a "
+                             "result")
     parser.add_argument('--device', default=None)
     args = parser.parse_args(argv)
 
@@ -759,6 +771,7 @@ def main(argv=None) -> int:
         revisit_clean=not args.no_revisit_clean,
         recalibrate_on=args.recalibrate_on, num_workers=args.num_workers,
         shuffle_stream=not args.no_shuffle, seed=args.seed,
+        bn_method=args.bn_method,
         max_batches_per_condition=args.max_batches, device=args.device)
 
     print(f"\nBN statistics: {summary['bn_stats_source']}")

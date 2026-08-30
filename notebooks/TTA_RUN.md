@@ -67,16 +67,24 @@ print(self_check(model, list(itertools.islice(loader, 4)), manager.device))
 #     Measure a state, load it, measure again in plain eval(). A state that
 #     moves is describing a different network: every layer below the first was
 #     measured while the layers above it still carried the old statistics.
+#
+#     The three collection methods, side by side. This IS a measurement the
+#     write-up quotes, not a debugging aid: it is the evidence that the void
+#     run had a cause and that the cause is gone.
 from iot.bn_bank import assert_state_is_fixed_point, collect_bn_state, state_residual
 
 few = list(itertools.islice(loader, 8))
 
-wrong = collect_bn_state(model, few, manager.device, self_consistent=False)
-print('measured all at once, in eval  :', state_residual(model, wrong, few, manager.device))
+for method in ('as-is', 'batch-stats', 'sequential'):
+    state = collect_bn_state(model, few, manager.device, method=method)
+    residual = state_residual(model, state, few, manager.device)
+    print(f"{method:12s} mean {residual['mean_shift']:9.6f} sigma   "
+          f"var {residual['var_ratio'] * 100:9.3f}%   "
+          f"worst {residual['var_layer']}")
 
-right = collect_bn_state(model, few, manager.device, self_consistent=True)
-print('measured on batch statistics   :', state_residual(model, right, few, manager.device))
-assert_state_is_fixed_point(model, right, few, manager.device)
+# Only the last one has to hold, and it is the one every state is built with.
+exact = collect_bn_state(model, few, manager.device, method='sequential')
+assert_state_is_fixed_point(model, exact, few, manager.device)
 ```
 
 ```bash
@@ -90,6 +98,11 @@ assert_state_is_fixed_point(model, right, few, manager.device)
 # 7. Recalibration: ImageNet BatchNorm statistics -> GTSRB's. Written once and
 #    kept, so the Source model is one file rather than something recomputed.
 #    Writes <checkpoint>_bn.pkl beside the original.
+#
+#    This now sweeps the 20 layers one at a time and prints [n/20] as it goes -
+#    a few minutes rather than one pass, because each pass stops as soon as its
+#    layer has been seen. It raises rather than writing a state that is not a
+#    fixed point.
 !python -m iot.source_model --checkpoint $CKPT --data dataset/gtsrb/train
 
 # 8. The study.
@@ -119,7 +132,7 @@ Then bring back the three small files - `results/tta/conditions.csv`,
 | step | criterion |
 |---|---|
 | 5 `self_check` | returns `{'mean': ..., 'var': ...}` both **below 1e-6**, or raises. This catches the one bug that stays invisible otherwise: per-batch variances being averaged gives BatchNorm layers that are too narrow, and such a state still loads, still classifies, and only shows up as a disappointing number. |
-| 5b fixed point | `assert_state_is_fixed_point` does **not** raise on the self-consistent state: the input mean moves by less than 0.05 sigma and the variance by less than 10%. The `self_consistent=False` line beside it should be visibly worse - that is the old behaviour, printed rather than described. |
+| 5b fixed point | Three lines, and the shape of them is the point: `as-is` ~8.8 sigma (what voided the first run), `batch-stats` ~0.23 (closer, still not a fixed point - during that pass the layers above use *per-batch* statistics while the finished state uses pooled ones, and the gap grows with depth), `sequential` at **float noise, ~1e-6**. `assert_state_is_fixed_point` must not raise on the last one. If `sequential` is not ~1e-6, stop: the sweep's exactness argument is wrong and nothing below it is worth running. |
 | 6 branch walk | exits 0, `results/tta_smoke/summary.json` written, four arms in `accuracy_by_arm`, and `check_descriptor_independence` did **not** raise. |
 | 7 recalibration | ~26640 images, ~4800 channels across the BatchNorm layers, `..._bn.pkl` written. It now also prints a `fixed point:` line and **raises** if the state is not one. Its `bn_stats_source` is no longer `imagenet`, and the **weights are unchanged bit for bit** - the pass moves buffers, never parameters. |
 | 8 the study | `conditions.csv`, `batches.csv`, `summary.json`; bank of **13 states** (clean + 12 seen corruptions), ~460 KB; a finite threshold. `summary.json` carries `bn_fixed_point` - small is the pass. And one arithmetic sanity check before reading anything else: **`source` on clean must beat `blind` on clean.** Running statistics pooled over 26640 images losing to a 128-image batch estimate is not a result, it is the 2026-08-30 bug returning. |
