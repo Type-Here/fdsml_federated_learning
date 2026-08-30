@@ -239,11 +239,19 @@ class ModelManager:
         dataset = ImageFolder(root=data_path, transform=self.transform_pipeline)
         return DataLoader(dataset, batch_size=batch_size, shuffle=(split == 'train'))
 
+    def _make_optimizer(self, trainable_params, lr: float) -> torch.optim.Optimizer:
+        """Build the optimizer local training uses.
+
+        Extracted so a subclass can change the optimizer without restating the
+        whole of `train`. Returns Adam, which is what this line always was.
+        """
+        return torch.optim.Adam(trainable_params, lr=lr)
+
     def train(self, epochs: int, lr: float, batch_size: int,
               algorithm: str = "FedAvg", global_weights: List[np.ndarray] = None,
               mu: float = 0.0) -> Tuple[float, Dict, float, int]:
         trainable_params = self._get_trainable_parameters()
-        optimizer = torch.optim.Adam(trainable_params, lr=lr)
+        optimizer = self._make_optimizer(trainable_params, lr)
         train_loader = self._get_dataloader('train', batch_size)
 
         global_params_tensor = None

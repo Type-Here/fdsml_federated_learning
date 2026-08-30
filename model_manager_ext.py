@@ -128,6 +128,38 @@ class ExtendedModelManager(ModelManager):
         )
         return transforms.Compose([base[0], affine] + base[1:])
 
+    def _make_optimizer(self, trainable_params, lr: float) -> torch.optim.Optimizer:
+        """Adam, as the received code does, or SGD when the run asks for it.
+
+        Config key `optimizer`: `"adam"` (the default, and what every run before
+        this key existed used) or `"sgd"`. `sgd_momentum` defaults to 0.9 and is
+        read only in the SGD branch.
+
+        Why this is worth a switch. The aggregation in `fipa.py` weighs a client
+        per *direction* of parameter space, and the directions it keeps are the
+        leading eigenvectors of that client's gradients. The update it applies
+        therefore lives in the span of those gradients, and anything the client
+        moved outside that span is multiplied by zero. Plain SGD moves along
+        `-lr * sum_i g_i`, a combination of the gradients themselves, so it stays
+        inside that span; Adam rescales every coordinate by its own running
+        gradient magnitude, which spreads the movement over all parameters and
+        leaves most of it in directions the aggregation discards. Which of the
+        two the head actually needs is a measurement, not an assumption - the
+        ratios recorded each round in `aggregator_ext.py` are what answers it.
+
+        Raises:
+            ValueError: on an unknown name. Silently falling back to Adam would
+                make a mis-typed configuration look like a completed experiment.
+        """
+        name = str(self.config.get('optimizer', 'adam')).strip().lower()
+        if name == 'adam':
+            return torch.optim.Adam(trainable_params, lr=lr)
+        if name == 'sgd':
+            momentum = float(self.config.get('sgd_momentum', 0.9))
+            return torch.optim.SGD(trainable_params, lr=lr, momentum=momentum)
+        raise ValueError(
+            f"unknown optimizer '{name}': expected 'adam' or 'sgd'")
+
     def _get_dataloader(self, split: str, batch_size: int,
                         augment: Optional[bool] = None) -> DataLoader:
         """The base loader, with canonical labels and a private shuffle RNG.
