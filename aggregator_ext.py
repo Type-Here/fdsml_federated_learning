@@ -435,12 +435,112 @@ class ExtendedAggregator(Aggregator):
         mean_explained = float(np.nanmean(explained)) if explained else float('nan')
         self.metrics_history.setdefault(self.round_number, {})[
             'fipa_explained_variance'] = mean_explained
+        self._record_projection_diagnostics(factors, rtol)
         self.logger.info(
             "FIPA aggregation complete over %d clients (rank per client: %s). "
             "Mean explained variance %.4f.",
             len(factors), [c.curvature.shape[0] for c in factors], mean_explained,
         )
         return True
+
+    def _record_projection_diagnostics(self, factors: List[fipa.ClientFactors],
+                                       rtol: float) -> None:
+        """How much of each client's movement the kept directions can still see.
+
+        A diagnostic, not a step of the algorithm: it runs *after* the
+        aggregation and reads `self.current_weights` back, so it cannot change
+        what the round produces. It recomputes the consensus curvature rather
+        than threading it out of `fipa.fipa_aggregate`, which costs one extra QR
+        - a fraction of a second against a round measured in minutes - and keeps
+        the aggregation call exactly as it was.
+
+        Three numbers, and the reason they exist. FIPA's update is
+        `theta + sum_m B_m Delta_m` with `B_m = a_m H^+ H_m`, and the range of
+        `H^+` is the span of the clients' kept curvature directions - at most
+        `M * r` of the model's p parameters, i.e. 20 out of 142379 with four
+        clients at rank 5. Whatever part of a client's movement lies outside that
+        span is multiplied by zero. So the algorithm's usefulness depends on a
+        quantity nothing was measuring: how much of `Delta_m` lies inside it.
+
+            delta_in_local   ||U_m^T Delta_m|| / ||Delta_m||
+                             the share of client m's movement its *own* kept
+                             directions retain. This is the one that decides
+                             whether the low-rank truncation is cheap or fatal.
+
+            delta_in_joint   ||Q^T Delta_m|| / ||Delta_m||
+                             the same against the round's joint subspace Q,
+                             which spans every client's directions. Never
+                             smaller than `delta_in_local`; the gap says how much
+                             of m's movement is described by the *other*
+                             clients' directions.
+
+            step_ratio       ||theta_new - theta|| / ||sum_m a_m Delta_m||
+                             the length of the step FIPA actually took against
+                             the one plain weighted averaging would have taken
+                             from the same deltas. Near 1 the preconditioner is
+                             redistributing; far below 1 it is discarding the
+                             movement; far above 1 it is amplifying, which points
+                             at the pseudo-inverse cut rather than at the rank.
+
+        The means are weighted by `a_m = N_m / N`, the same share the aggregation
+        itself weights by, so a client holding a handful of tracks does not move
+        the round's number as much as one holding most of them. Per-client values
+        go to the log, where they can be read against that client's partition.
+
+        Plaintext only. On the encrypted route the server holds `Enc(z_m)` and
+        never a delta in any form, so none of these can be formed there - which
+        is why this is called from `_aggregate_fipa` and not from
+        `_aggregate_fipa_encrypted`.
+        """
+        curvature = fipa.consensus_curvature(factors, rtol)
+        basis = curvature.basis
+        shares = fipa.sample_weights(factors)
+
+        theta, _ = fipa.flatten_weights(self.global_weights)
+        theta_new, _ = fipa.flatten_weights(self.current_weights)
+
+        # The step plain weighted averaging would have taken from these same
+        # deltas: sum_m a_m Delta_m. Built here rather than taken from the
+        # aggregation, which never forms it.
+        fedavg_step = np.zeros_like(theta)
+        in_local, in_joint = [], []
+        for client, share in zip(factors, shares):
+            delta = np.asarray(client.delta, dtype=np.float64)
+            fedavg_step += share * delta
+            norm = float(np.linalg.norm(delta))
+            if norm == 0.0:
+                # A client that did not move has no direction to be aligned
+                # with. Reporting 0 keeps it in the mean as "contributed
+                # nothing", which is what happened.
+                in_local.append(0.0)
+                in_joint.append(0.0)
+                continue
+            in_local.append(float(np.linalg.norm(
+                fipa.project_delta(client.directions, delta))) / norm)
+            in_joint.append(float(np.linalg.norm(basis.T @ delta)) / norm)
+
+        fedavg_norm = float(np.linalg.norm(fedavg_step))
+        step_ratio = (float(np.linalg.norm(theta_new - theta)) / fedavg_norm
+                      if fedavg_norm > 0 else float('nan'))
+
+        # `sample_weights` returns all zeros when no client reported any data,
+        # and `np.average` raises on weights summing to zero.
+        usable = sum(shares) > 0
+        mean_local = float(np.average(in_local, weights=shares)) if usable else float('nan')
+        mean_joint = float(np.average(in_joint, weights=shares)) if usable else float('nan')
+
+        self.metrics_history.setdefault(self.round_number, {}).update({
+            'fipa_delta_in_local': mean_local,
+            'fipa_delta_in_joint': mean_joint,
+            'fipa_step_ratio': step_ratio,
+        })
+        self.logger.info(
+            "FIPA projection diagnostics: delta kept by own directions %.4f, by "
+            "the joint subspace %.4f, step length vs weighted average %.4f. "
+            "Per client: local %s, joint %s.",
+            mean_local, mean_joint, step_ratio,
+            ["%.4f" % v for v in in_local], ["%.4f" % v for v in in_joint],
+        )
 
     # ------------------------------------------------------------------
     # Dispatch on the aggregation algorithm in the encrypted path too
