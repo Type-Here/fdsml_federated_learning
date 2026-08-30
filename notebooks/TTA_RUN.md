@@ -1,10 +1,5 @@
 # TTA run - Part B on the FedAvg alpha=0.5 checkpoint
 
-The inference half, executed. Everything in `iot/` is already written and the
-torch-free half is covered by the local test suite; what has **never run** is
-`stream_eval.py`, `source_model.py`, `bn_bank.py`, `bn_adapt.py`. Steps 5 and 6
-exist for exactly that reason - do not skip them to save ten minutes.
-
 The checkpoint:
 
     models/second_run_checkpoints/gtsrb_ResNet18_FedAvg_a0.5_c4_le1_seed42_20260829-185510.pkl
@@ -63,6 +58,27 @@ loader = image_folder_loader('dataset/gtsrb/train', manager.transform_pipeline,
 print(self_check(model, list(itertools.islice(loader, 4)), manager.device))
 ```
 
+```python
+# 5b. The check self_check structurally CANNOT do, and the one that would have
+#     saved the 2026-08-30 run. self_check compares two runs of the same
+#     collection method, so it verifies that the accumulation is additive - not
+#     that the resulting state describes the network it gets loaded into.
+#
+#     Measure a state, load it, measure again in plain eval(). A state that
+#     moves is describing a different network: every layer below the first was
+#     measured while the layers above it still carried the old statistics.
+from iot.bn_bank import assert_state_is_fixed_point, collect_bn_state, state_residual
+
+few = list(itertools.islice(loader, 8))
+
+wrong = collect_bn_state(model, few, manager.device, self_consistent=False)
+print('measured all at once, in eval  :', state_residual(model, wrong, few, manager.device))
+
+right = collect_bn_state(model, few, manager.device, self_consistent=True)
+print('measured on batch statistics   :', state_residual(model, right, few, manager.device))
+assert_state_is_fixed_point(model, right, few, manager.device)
+```
+
 ```bash
 # The path, once, so the cells below are copy-pasteable
 %env CKPT=models/second_run_checkpoints/gtsrb_ResNet18_FedAvg_a0.5_c4_le1_seed42_20260829-185510.pkl
@@ -80,6 +96,17 @@ print(self_check(model, list(itertools.islice(loader, 4)), manager.device))
 !python -m iot.stream_eval --checkpoint ${CKPT%.pkl}_bn.pkl \
     --gtsrb-c dataset/gtsrb_c --out results/tta \
     --batch-size 128 --num-workers 4
+
+# 9. The control the first run did not have: the same stream on the ORIGINAL
+#    checkpoint, i.e. ImageNet statistics, source arm only. This is what makes
+#    "the recalibration bought N points on clean images" a measured sentence
+#    rather than an assumption - and it is the cheapest thing in the notebook,
+#    one arm over the same 100000 images. Do not skip it: without it, a Source
+#    baseline that is quietly broken looks exactly like a Source baseline that
+#    is simply weak.
+!python -m iot.stream_eval --checkpoint $CKPT \
+    --gtsrb-c dataset/gtsrb_c --out results/tta_imagenet \
+    --arms source --batch-size 128 --num-workers 4
 ```
 
 Then bring back the three small files - `results/tta/conditions.csv`,
@@ -92,13 +119,42 @@ Then bring back the three small files - `results/tta/conditions.csv`,
 | step | criterion |
 |---|---|
 | 5 `self_check` | returns `{'mean': ..., 'var': ...}` both **below 1e-6**, or raises. This catches the one bug that stays invisible otherwise: per-batch variances being averaged gives BatchNorm layers that are too narrow, and such a state still loads, still classifies, and only shows up as a disappointing number. |
+| 5b fixed point | `assert_state_is_fixed_point` does **not** raise on the self-consistent state: the input mean moves by less than 0.05 sigma and the variance by less than 10%. The `self_consistent=False` line beside it should be visibly worse - that is the old behaviour, printed rather than described. |
 | 6 branch walk | exits 0, `results/tta_smoke/summary.json` written, four arms in `accuracy_by_arm`, and `check_descriptor_independence` did **not** raise. |
-| 7 recalibration | ~26640 images, ~4800 channels across the BatchNorm layers, `..._bn.pkl` written. Its `bn_stats_source` is no longer `imagenet`, and the **weights are unchanged bit for bit** - the pass moves buffers, never parameters. |
-| 8 the study | `conditions.csv`, `batches.csv`, `summary.json`; bank of **13 states** (clean + 12 seen corruptions), ~460 KB; a finite threshold. |
+| 7 recalibration | ~26640 images, ~4800 channels across the BatchNorm layers, `..._bn.pkl` written. It now also prints a `fixed point:` line and **raises** if the state is not one. Its `bn_stats_source` is no longer `imagenet`, and the **weights are unchanged bit for bit** - the pass moves buffers, never parameters. |
+| 8 the study | `conditions.csv`, `batches.csv`, `summary.json`; bank of **13 states** (clean + 12 seen corruptions), ~460 KB; a finite threshold. `summary.json` carries `bn_fixed_point` - small is the pass. And one arithmetic sanity check before reading anything else: **`source` on clean must beat `blind` on clean.** Running statistics pooled over 26640 images losing to a 128-image batch estimate is not a result, it is the 2026-08-30 bug returning. |
+| 9 the control | `results/tta_imagenet/summary.json`, `source` arm only. Its `bn_fixed_point` residual is expected to be **large** - ImageNet's statistics genuinely do not describe GTSRB, and that number is the size of the shift step 7 exists to remove. Compare its clean accuracy with step 8's: the difference is what the recalibration bought. |
 
 ---
 
 ## Traps
+
+**A set of BatchNorm statistics has to be self-consistent, and measuring them
+all at once does not make them so.** This is what voided 2026-08-30. A layer's
+`running_mean` / `running_var` describe *its input*, and that input is produced
+by the layers above it - which are normalizing with whatever is loaded at the
+time. Measure all twenty of a ResNet18's layers in one `eval()` pass and only
+`bn1` is exact, because `conv1` is frozen; `layer1.0.bn1` moves the moment its
+own state is replaced, so `layer1.0.bn2`'s measurement is already stale, and the
+error compounds with depth. Loading the set then puts the network on statistics
+describing a distribution that no longer exists, and it classifies at chance
+with nothing raising. `self_consistent=True` measures with the layers
+normalizing on the batch in hand, so each input is produced by upstream layers
+already adapted to the data. It is the default for anything that gets loaded -
+`recalibrate` and `build_bank` - and deliberately **not** the default for a
+descriptor, which is read from `bn1` alone and must be read exactly the way the
+stream reads it.
+
+**The stream is shuffled, and that is not cosmetic.** `ImageFolder` walks the
+class directories in order, so an unshuffled batch of 128 out of a 2000-image
+condition holds two or three of the 43 sign types. Blind BN-adapt's entire
+estimate *is* that batch, and the routing descriptor is supposed to describe the
+degradation rather than which sign is in frame - both are measuring the wrong
+thing on a class-homogeneous batch, and so is the threshold, which is calibrated
+from single batches during the bank build. `--seed` keeps a shuffled run
+reproducible batch for batch; `--no-shuffle` restores the old order as a stress
+case ("a device that sees one sign type at a time"), which is a finding if
+reported as one and a confound if not.
 
 **Regenerate GTSRB-C here; do not upload it.** The dataset on the development
 machine was built under numpy 1.26.4. Colab runs numpy 2, where `fog`
@@ -112,7 +168,7 @@ never from the package, and check step 4's directory count.
 slip. The recalibration stands in for the pass each client would run on **its own
 clean training data** - one forward pass, no labels, no gradients - so the
 training split is what it means. Recalibrating on `test` instead would compute
-the model's normalisation statistics from the very images GTSRB-C is built out
+the model's normalization statistics from the very images GTSRB-C is built out
 of, so the Source arm would already carry the evaluation set's statistics and
 every arm's number would be inflated by an amount nobody could separate from the
 adaptation being measured. The two archives are disjoint (26640 / 12630), which
