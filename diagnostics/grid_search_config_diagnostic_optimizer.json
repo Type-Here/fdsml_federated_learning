@@ -1,0 +1,49 @@
+{
+  "_comment": "Does the local optimizer decide whether FIPA can work at all? FIPA weighs a client per direction of parameter space, and the directions it keeps are the leading eigenvectors of that client's gradients: the update it applies lives in the span of those directions, at most num_clients * fipa_rank = 20 of the head's 142379 parameters, and whatever a client moved outside that span is multiplied by zero. Adam rescales every coordinate by its own running gradient magnitude, so the movement it produces is spread over all parameters; plain SGD moves along a combination of the gradients themselves and stays inside the span the aggregation keeps. The checkpoint run that prompted this had FIPA at dirichlet_alpha 0.1 reach f1 0.474 against FedAvg's 0.594, with the training loss flat at 0.62 from round 3 - where the warmup hands over - to round 29, and a saved classifier layer of norm 9.4 against FedAvg's 56.6, barely off its random initialization of about 3.8. Four runs, FIPA only: the ratios this asks about are recorded by FIPA rounds, and FedAvg at this alpha is already measured by the main checkpoint grid. adam at 0.001 reproduces the failing run and is the reference; sgd at 0.01 is the candidate; the other two cells cost nothing and tell us whether any difference is the optimizer or just the step size, which is what keeps 'SGD looks better' from meaning 'SGD moves less'. fipa_rank and fipa_warmup_rounds are deliberately left at the values that failed - this changes one thing. Read fipa_delta_in_local, fipa_delta_in_joint and fipa_step_ratio in the per-round CSV: they are blank for rounds 0 to 2, which are warmup and aggregate as FedAvg, and present from round 3 on. early_stop_patience is 999, i.e. disabled, so the whole trajectory is visible rather than cut where the loss first rises.",
+  "ip_address": "127.0.0.1",
+  "port": 5401,
+  "base_csv_path": "csv_diagnostic",
+  "base_log_path": "logs_diagnostic",
+  "base_plot_path": "static/plots_diagnostic",
+  "base_split_data_path": "run_dataset_diagnostic",
+  "base_checkpoint_path": "checkpoints_diagnostic",
+  "early_stop_patience": 999,
+  "weighted_aggregation": true,
+  "num_parallel_executions": 1,
+  "seed": 42,
+  "datasets": [
+    {
+      "name": "gtsrb",
+      "path": "dataset/gtsrb/train",
+      "num_classes": 43
+    }
+  ],
+  "common_search_space": {
+    "encryption_mode": ["no_encryption"],
+    "device": ["cuda"],
+    "global_epoch": [10],
+    "local_epoch": [1],
+    "num_clients": [4],
+    "models_percentage": [1],
+    "optimizer": ["adam", "sgd"],
+    "sgd_momentum": [0.9],
+    "learning_rate": [0.001, 0.01],
+    "batch_size": [16],
+    "aggregation_algorithm": ["FIPA"],
+    "fedprox_mu": [0.05],
+    "partition_strategy": ["dirichlet"],
+    "dirichlet_alpha": [0.1],
+    "partition_unit": ["track"],
+    "fipa_warmup_rounds": [3],
+    "fipa_rank": [5],
+    "fipa_grad_batches": [64],
+    "fipa_pinv_rtol": [1e-8],
+    "train_augmentation": [false]
+  },
+  "model_specific_search_space": {
+    "ResNet18": {
+      "image_size": [128],
+      "num_custom_layers": [2]
+    }
+  }
+}

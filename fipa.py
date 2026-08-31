@@ -596,7 +596,7 @@ def project_delta(directions: np.ndarray, delta: np.ndarray) -> np.ndarray:
     the FIPA update does with `Delta_m` is, written out:
 
         B_m Delta_m = a_m H^+ U_m diag(L_m) (U_m^T Delta_m)
-                                             \____ z_m ____/
+                                             |____ z_m ____|
 
     Every appearance of `Delta_m` is behind `U_m^T`. The component of the delta
     orthogonal to the client's own curvature directions is multiplied by zero
@@ -636,10 +636,10 @@ def preconditioners(clients: Sequence[ClientFactors],
         increment = sum_m B_m Delta_m = sum_m P_m z_m
 
         P_m = Q ( V diag(sigma^+) V^T ( (Q^T U_m) * (a_m L_m) ) )     shape (p, r)
-              \________________ all (s, s) and (s, r) __________/
+              |________________ all (s, s) and (s, r) __________|
 
     Written the natural way the server would do three things in a row to the
-    same ciphertext - project onto Q, apply H^+, come back up to R^p - and under
+    same ciphertext - project onto Q, apply H^+, come back up to R^p. Under
     Paillier each of those multiplies the encoding by the encoding of a float,
     so the third one lands past the representable ceiling and decrypts to a
     plausible wrong number instead of raising. Fusing them costs nothing,

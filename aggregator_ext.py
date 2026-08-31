@@ -23,6 +23,8 @@ Contents:
     keyed by client id, that a discrepancy-aware rule needs.
   - `client_denominator`          : what the client must divide the round
     payload by, forwarded from `aggregation_policy`.
+  - `save_results`                : the base behavior plus the trained model
+    itself, written to disk on the scale a model is actually used on.
 
 The algorithm families, the warmup boundary and the denominator rule live in
 `aggregation_policy`, which imports neither `aggregator` nor torch and is
@@ -31,11 +33,14 @@ lives in `fipa.py` and its Paillier arithmetic in `fipa_encrypted.py`, torch-fre
 for the same reason. This file is the part that has to touch tensors, and it is
 deliberately thin.
 
-Deliberately not here yet: the FedDisco branches and the global model
-checkpoint.
+Deliberately not here yet: the FedDisco branches.
 """
 
+import json
 import logging
+import os
+import pickle
+import time
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -80,6 +85,19 @@ class ExtendedAggregator(Aggregator):
         # `total_training_size_in_round` on the server already holds *this*
         # round's total, while the payload was scaled by the previous one's.
         self.last_broadcast_denominator: float = 0.0
+
+        # The scale of what the last aggregation left in `current_weights`, and
+        # the scale of `best_model_weights`, captured when the best model is
+        # recorded rather than recomputed at the end.
+        #
+        # The checkpoint needs this and cannot do without it: the server
+        # aggregates by *summation* and the clients divide, so
+        # `best_model_weights` holds `N * theta` after a size-weighted round -
+        # with N in the tens of thousands - and plain `theta` after a FIPA one.
+        # Writing it out unscaled produces a file that loads without complaint
+        # and predicts noise.
+        self.last_result_denominator: float = 0.0
+        self.best_model_denominator: float = 0.0
 
         algorithm = self.config.get("aggregation_algorithm", "FedAvg")
         self.encryption_mode: str = self.config.get("encryption_mode", "no_encryption")
@@ -192,13 +210,53 @@ class ExtendedAggregator(Aggregator):
         The arithmetic mirrors `federated_client._process_server_weights` line
         for line, on purpose - the server's theta and the clients' theta have to
         be the same numbers, or the deltas are relative to a model nobody
-        trained. A denominator of 0 means round 0, where the payload is the
-        initial weights rather than a sum and the client uses it unscaled.
+        trained.
+        """
+        self.global_weights = self._descale(self.current_weights, denominator)
+
+    @staticmethod
+    def _descale(weights: List[np.ndarray], denominator: float) -> List[np.ndarray]:
+        """Turn an aggregation result back into parameters.
+
+        One function for the two places that need it - the FIPA snapshot and the
+        checkpoint - so the two divisions cannot drift apart.
+
+        A denominator of 0 means there is nothing to undo: it is round 0, whose
+        payload is the initial weights rather than a sum, and the client uses it
+        unscaled too.
         """
         if denominator > 0:
-            self.global_weights = [w / denominator for w in self.current_weights]
-        else:
-            self.global_weights = [np.array(w, copy=True) for w in self.current_weights]
+            return [w / denominator for w in weights]
+        return [np.array(w, copy=True) for w in weights]
+
+    def _record_aggregation(self, algorithm: str, client_updates: List[Dict]) -> None:
+        """Remember which rule ran, and at what scale it left the result.
+
+        Called from both aggregation paths after a successful round. The scale
+        cannot be reconstructed afterwards: `client_denominator` answers for the
+        payload the server is *about to broadcast*, which is this same result,
+        but the round's `N` is gone by the time the checkpoint is written.
+        """
+        self.last_aggregation_algorithm = algorithm
+        total_training_size = sum(u.get('train_size', 0) for u in client_updates)
+        self.last_result_denominator = denominator_for_algorithm(
+            algorithm, total_training_size)
+
+    def aggregate_evaluation_results(self, eval_updates: List[Dict],
+                                     current_round: int) -> bool:
+        """Base behavior, plus the scale of whatever became the best model.
+
+        The base class records `best_model_weights` in the middle of its own
+        bookkeeping (`aggregator.py:119-126`), so rather than restating that
+        logic here we let it run and detect the update by watching `best_round`.
+        That keeps the best-model rule in exactly one place - if it ever changes,
+        this keeps following it.
+        """
+        previous_best_round = self.best_round
+        early_stop = super().aggregate_evaluation_results(eval_updates, current_round)
+        if self.best_round != previous_best_round:
+            self.best_model_denominator = self.last_result_denominator
+        return early_stop
 
     # ------------------------------------------------------------------
     # The per-client label distributions a discrepancy-aware rule needs
@@ -289,7 +347,7 @@ class ExtendedAggregator(Aggregator):
             raise ValueError(f"Aggregation algorithm '{algorithm}' is not supported.")
 
         if aggregated:
-            self.last_aggregation_algorithm = algorithm
+            self._record_aggregation(algorithm, client_updates)
         return aggregated
 
     @staticmethod
@@ -377,12 +435,112 @@ class ExtendedAggregator(Aggregator):
         mean_explained = float(np.nanmean(explained)) if explained else float('nan')
         self.metrics_history.setdefault(self.round_number, {})[
             'fipa_explained_variance'] = mean_explained
+        self._record_projection_diagnostics(factors, rtol)
         self.logger.info(
             "FIPA aggregation complete over %d clients (rank per client: %s). "
             "Mean explained variance %.4f.",
             len(factors), [c.curvature.shape[0] for c in factors], mean_explained,
         )
         return True
+
+    def _record_projection_diagnostics(self, factors: List[fipa.ClientFactors],
+                                       rtol: float) -> None:
+        """How much of each client's movement the kept directions can still see.
+
+        A diagnostic, not a step of the algorithm: it runs *after* the
+        aggregation and reads `self.current_weights` back, so it cannot change
+        what the round produces. It recomputes the consensus curvature rather
+        than threading it out of `fipa.fipa_aggregate`, which costs one extra QR
+        - a fraction of a second against a round measured in minutes - and keeps
+        the aggregation call exactly as it was.
+
+        Three numbers, and the reason they exist. FIPA's update is
+        `theta + sum_m B_m Delta_m` with `B_m = a_m H^+ H_m`, and the range of
+        `H^+` is the span of the clients' kept curvature directions - at most
+        `M * r` of the model's p parameters, i.e. 20 out of 142379 with four
+        clients at rank 5. Whatever part of a client's movement lies outside that
+        span is multiplied by zero. So the algorithm's usefulness depends on a
+        quantity nothing was measuring: how much of `Delta_m` lies inside it.
+
+            delta_in_local   ||U_m^T Delta_m|| / ||Delta_m||
+                             the share of client m's movement its *own* kept
+                             directions retain. This is the one that decides
+                             whether the low-rank truncation is cheap or fatal.
+
+            delta_in_joint   ||Q^T Delta_m|| / ||Delta_m||
+                             the same against the round's joint subspace Q,
+                             which spans every client's directions. Never
+                             smaller than `delta_in_local`; the gap says how much
+                             of m's movement is described by the *other*
+                             clients' directions.
+
+            step_ratio       ||theta_new - theta|| / ||sum_m a_m Delta_m||
+                             the length of the step FIPA actually took against
+                             the one plain weighted averaging would have taken
+                             from the same deltas. Near 1 the preconditioner is
+                             redistributing; far below 1 it is discarding the
+                             movement; far above 1 it is amplifying, which points
+                             at the pseudo-inverse cut rather than at the rank.
+
+        The means are weighted by `a_m = N_m / N`, the same share the aggregation
+        itself weights by, so a client holding a handful of tracks does not move
+        the round's number as much as one holding most of them. Per-client values
+        go to the log, where they can be read against that client's partition.
+
+        Plaintext only. On the encrypted route the server holds `Enc(z_m)` and
+        never a delta in any form, so none of these can be formed there - which
+        is why this is called from `_aggregate_fipa` and not from
+        `_aggregate_fipa_encrypted`.
+        """
+        curvature = fipa.consensus_curvature(factors, rtol)
+        basis = curvature.basis
+        shares = fipa.sample_weights(factors)
+
+        theta, _ = fipa.flatten_weights(self.global_weights)
+        theta_new, _ = fipa.flatten_weights(self.current_weights)
+
+        # The step plain weighted averaging would have taken from these same
+        # deltas: sum_m a_m Delta_m. Built here rather than taken from the
+        # aggregation, which never forms it.
+        fedavg_step = np.zeros_like(theta)
+        in_local, in_joint = [], []
+        for client, share in zip(factors, shares):
+            delta = np.asarray(client.delta, dtype=np.float64)
+            fedavg_step += share * delta
+            norm = float(np.linalg.norm(delta))
+            if norm == 0.0:
+                # A client that did not move has no direction to be aligned
+                # with. Reporting 0 keeps it in the mean as "contributed
+                # nothing", which is what happened.
+                in_local.append(0.0)
+                in_joint.append(0.0)
+                continue
+            in_local.append(float(np.linalg.norm(
+                fipa.project_delta(client.directions, delta))) / norm)
+            in_joint.append(float(np.linalg.norm(basis.T @ delta)) / norm)
+
+        fedavg_norm = float(np.linalg.norm(fedavg_step))
+        step_ratio = (float(np.linalg.norm(theta_new - theta)) / fedavg_norm
+                      if fedavg_norm > 0 else float('nan'))
+
+        # `sample_weights` returns all zeros when no client reported any data,
+        # and `np.average` raises on weights summing to zero.
+        usable = sum(shares) > 0
+        mean_local = float(np.average(in_local, weights=shares)) if usable else float('nan')
+        mean_joint = float(np.average(in_joint, weights=shares)) if usable else float('nan')
+
+        self.metrics_history.setdefault(self.round_number, {}).update({
+            'fipa_delta_in_local': mean_local,
+            'fipa_delta_in_joint': mean_joint,
+            'fipa_step_ratio': step_ratio,
+        })
+        self.logger.info(
+            "FIPA projection diagnostics: delta kept by own directions %.4f, by "
+            "the joint subspace %.4f, step length vs weighted average %.4f. "
+            "Per client: local %s, joint %s.",
+            mean_local, mean_joint, step_ratio,
+            ["%.4f" % v for v in in_local], ["%.4f" % v for v in in_joint],
+        )
 
     # ------------------------------------------------------------------
     # Dispatch on the aggregation algorithm in the encrypted path too
@@ -437,7 +595,7 @@ class ExtendedAggregator(Aggregator):
             )
 
         if aggregated:
-            self.last_aggregation_algorithm = algorithm
+            self._record_aggregation(algorithm, round_client_updates)
         return aggregated
 
     def _aggregate_fipa_encrypted(self, client_updates: List[Dict]) -> bool:
@@ -598,3 +756,192 @@ class ExtendedAggregator(Aggregator):
         if current_round not in self.metrics_history:
             self.metrics_history[current_round] = {}
         self.metrics_history[current_round]["train_loss"] = mean_loss
+
+    # ------------------------------------------------------------------
+    # The global model, written to disk
+    # ------------------------------------------------------------------
+    def save_results(self) -> None:
+        """Base behavior, plus the trained model itself.
+
+        Until now a finished run left only its metrics: `best_model_weights`
+        lived in memory and the process exited. Everything downstream of
+        training - evaluating under corrupted input, adapting normalisation
+        statistics - starts from a model, so the run has to leave one behind.
+
+        The checkpoint is written after the summary, and a failure to write it
+        is logged rather than raised: the run's results are already valid at
+        that point, and losing them as well would turn a missing file into a
+        repeated run.
+        """
+        super().save_results()
+
+        # The base class strips the machine-specific paths out of the summary so
+        # they never reach the shared results CSV; the checkpoint ones we added
+        # belong to the same category.
+        if isinstance(self.run_summary, dict):
+            for key in ('run_checkpoint_output_path', 'base_checkpoint_path'):
+                self.run_summary.pop(key, None)
+
+        try:
+            checkpoint_path = self._save_checkpoint()
+        except Exception:
+            self.logger.exception("Could not write the global model checkpoint.")
+            return
+
+        if checkpoint_path and isinstance(self.run_summary, dict):
+            # Lands in the shared results CSV automatically, so a row can be
+            # traced to the model it produced.
+            self.run_summary['checkpoint_path'] = checkpoint_path
+
+    def _checkpoint_directory(self) -> str:
+        """Where checkpoints go, with the same shape as the other output paths.
+
+        The grid-search worker sets `run_checkpoint_output_path` alongside
+        `run_metrics_output_path`; the fallback keeps a standalone run (a smoke
+        test, a manual server) from failing for want of a config key.
+        """
+        return self.config.get(
+            'run_checkpoint_output_path',
+            self.config.get('base_checkpoint_path', 'checkpoints'),
+        )
+
+    def _checkpoint_stem(self) -> str:
+        """A filename that says what the model is without opening it."""
+        parts = [
+            str(self.config.get('dataset_name', 'dataset')),
+            str(self.config.get('model_name', 'model')),
+            str(self.config.get('aggregation_algorithm', 'FedAvg')),
+        ]
+        if self.config.get('partition_strategy') == 'dirichlet':
+            parts.append(f"a{self.config.get('dirichlet_alpha')}")
+        else:
+            parts.append('iid')
+        parts.extend([
+            f"c{self.config.get('num_clients')}",
+            f"le{self.config.get('local_epoch')}",
+            f"seed{self.config.get('seed')}",
+            time.strftime('%Y%m%d-%H%M%S'),
+        ])
+        stem = '_'.join(parts)
+        return ''.join(c if (c.isalnum() or c in '._-') else '-' for c in stem)
+
+    def _save_checkpoint(self) -> Optional[str]:
+        """Write the best global model, on the scale a model is actually used on.
+
+        Returns the path written, or None when there is nothing to write.
+
+        Two conditions make a checkpoint impossible rather than merely
+        inconvenient, and both are reported instead of producing a file that
+        looks fine:
+
+        no best model      the run ended before any evaluation improved on the
+                           initial score, so there is nothing to save.
+
+        encryption on      `current_weights` holds Paillier ciphertext
+                           dictionaries and the server has no private key, by
+                           design - the Trusted Authority hands keys to clients
+                           only. A plaintext checkpoint has to come from a
+                           `no_encryption` run.
+        """
+        if self.best_model_weights is None:
+            self.logger.warning(
+                "No checkpoint written: no evaluation round ever improved on the "
+                "initial score, so there is no best model to save."
+            )
+            return None
+
+        if self.encryption_mode != 'no_encryption':
+            self.logger.warning(
+                "No checkpoint written: encryption_mode is '%s', so the aggregated "
+                "weights are Paillier ciphertexts and the server holds no private "
+                "key. Produce the checkpoint from a no_encryption run.",
+                self.encryption_mode,
+            )
+            return None
+
+        weights = self._descale(self.best_model_weights, self.best_model_denominator)
+        metadata = self._checkpoint_metadata(weights)
+
+        directory = self._checkpoint_directory()
+        os.makedirs(directory, exist_ok=True)
+        stem = self._checkpoint_stem()
+        path = os.path.join(directory, f"{stem}.pkl")
+
+        with open(path, 'wb') as handle:
+            pickle.dump({'weights': weights, 'metadata': metadata}, handle,
+                        protocol=pickle.HIGHEST_PROTOCOL)
+
+        # The same metadata beside it in plain text, so a directory of
+        # checkpoints can be read without unpickling any of them.
+        with open(os.path.join(directory, f"{stem}.json"), 'w') as handle:
+            json.dump(metadata, handle, indent=2, default=str)
+
+        self.logger.info(
+            "Saved global model checkpoint to %s (round %d, f1 %.4f, %d parameters, "
+            "descaled by %.4f).",
+            path, self.best_round, self.best_f1_score,
+            metadata['num_parameters'], self.best_model_denominator,
+        )
+        return path
+
+    def _checkpoint_metadata(self, weights: List[np.ndarray]) -> Dict:
+        """Everything needed to rebuild the model this file came from.
+
+        A bare list of arrays would be unusable six months from now: `set_weights`
+        copies positionally into whatever `_get_trainable_parameters` returns, so
+        loading into a model built with a different `num_custom_layers` or a
+        different `num_classes` either raises on a shape mismatch or, worse,
+        silently fits. Recording the architecture costs nothing here and avoids a
+        second checkpoint format later.
+        """
+        return {
+            'created': time.strftime('%Y-%m-%dT%H:%M:%S'),
+
+            # What to build before loading `weights` into it.
+            'model_name': self.config.get('model_name'),
+            'num_custom_layers': self.config.get('num_custom_layers'),
+            'num_classes': self.config.get('num_classes'),
+            'image_size': self.config.get('image_size'),
+
+            # `set_weights` assigns positionally, so the order matters as much as
+            # the values.
+            'weights_layout': ("trainable parameters only, in the order of "
+                               "ModelManager._get_trainable_parameters()"),
+            'weights_shapes': [list(w.shape) for w in weights],
+            'num_parameters': int(sum(w.size for w in weights)),
+
+            # BatchNorm's running_mean / running_var are buffers, not parameters,
+            # so `get_weights` never saw them and no round ever aggregated them.
+            # Whoever loads this file gets the statistics of a freshly built
+            # backbone - ImageNet's. Stated explicitly because a model carrying
+            # them is not "the federated model", and treating it as one is the
+            # mistake the recalibration pass exists to prevent.
+            'bn_stats': None,
+            'bn_stats_source': 'imagenet',
+
+            # How the model was produced.
+            'aggregation_algorithm': self.config.get('aggregation_algorithm'),
+            'aggregation_denominator': self.best_model_denominator,
+            'encryption_mode': self.encryption_mode,
+            'fipa_warmup_rounds': self.config.get('fipa_warmup_rounds'),
+            'num_clients': self.config.get('num_clients'),
+            'models_percentage': self.config.get('models_percentage'),
+            'global_epoch': self.config.get('global_epoch'),
+            'local_epoch': self.config.get('local_epoch'),
+            'learning_rate': self.config.get('learning_rate'),
+            'batch_size': self.config.get('batch_size'),
+            'seed': self.config.get('seed'),
+
+            # On what data, and split how.
+            'dataset_name': self.config.get('dataset_name'),
+            'dataset_path': self.config.get('dataset_path'),
+            'partition_strategy': self.config.get('partition_strategy'),
+            'dirichlet_alpha': self.config.get('dirichlet_alpha'),
+            'partition_unit': self.config.get('partition_unit'),
+
+            # Which round this is, and how good it was.
+            'best_round': self.best_round,
+            'best_f1': self.best_f1_score,
+            'best_acc': self.best_accuracy,
+            'best_loss': self.best_loss,
+        }

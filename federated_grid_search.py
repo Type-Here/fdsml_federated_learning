@@ -17,6 +17,7 @@ import queue
 from config_fingerprint import (
     EXTRA_FINGERPRINT_KEYS,
     get_config_fingerprint,
+    normalize_augmentation_keys,
     normalize_fipa_keys,
     normalize_partition_keys,
 )
@@ -124,10 +125,15 @@ def run_grid_search_worker(
             worker_log_dir = os.path.join(config['base_log_path']+f'_{pc_name}', run_identifier)
             worker_plot_dir = os.path.join(config['base_plot_path']+f'_{pc_name}', run_identifier)
             worker_metrics_dir = os.path.join(config['base_csv_path']+f'_{pc_name}', "runs")
+            # Not per run_identifier like the logs: checkpoints from every worker
+            # collect in one directory, because what comes next reads them as a
+            # set - one model per configuration, compared side by side.
+            worker_checkpoint_dir = config.get('base_checkpoint_path', 'checkpoints') + f'_{pc_name}'
             os.makedirs(worker_splitting_dir, exist_ok=True)
             os.makedirs(worker_log_dir, exist_ok=True)
             os.makedirs(worker_plot_dir, exist_ok=True)
             os.makedirs(worker_metrics_dir, exist_ok=True)
+            os.makedirs(worker_checkpoint_dir, exist_ok=True)
             print("\n" + "#" * 80)
             print(f"### [Worker {worker_id}] DEQUEUED NEW CONFIG FOR: {dataset_name} | {config['model_name']} ###")
             config['worker_id'] = worker_id
@@ -144,6 +150,7 @@ def run_grid_search_worker(
             config['log_dir'] = worker_log_dir
             config['plot_dir'] = worker_plot_dir
             config['run_metrics_output_path'] = worker_metrics_dir
+            config['run_checkpoint_output_path'] = worker_checkpoint_dir
             config["MIN_NUM_WORKERS"] = int(config['num_clients'] * config['models_percentage'])
             ta_instance_ref = [];
             server_instance_ref = []
@@ -232,6 +239,7 @@ def main(config_path: str = GRID_SEARCH_CONFIG_PATH):
                 if row.get('aggregation_algorithm') != "FedProx": row['fedprox_mu'] = '0.0'
                 normalize_partition_keys(row)
                 normalize_fipa_keys(row)
+                normalize_augmentation_keys(row)
                 if 'ResNet' in model_name_from_row or 'GoogLeNet' in model_name_from_row or 'AlexNet' in model_name_from_row:
                     row.setdefault('image_size', '224')
                     row.setdefault('convnet_hidden1', '-1')
@@ -266,6 +274,7 @@ def main(config_path: str = GRID_SEARCH_CONFIG_PATH):
                 if hyper_config.get('aggregation_algorithm') != "FedProx": hyper_config['fedprox_mu'] = 0.0
                 normalize_partition_keys(hyper_config)
                 normalize_fipa_keys(hyper_config)
+                normalize_augmentation_keys(hyper_config)
                 if 'ResNet' in model_name or 'GoogLeNet' in model_name or 'AlexNet' in model_name:
                     # setdefault, NOT assignment: this block only normalizes keys so
                     # that fingerprints match across runs. A hard assignment here

@@ -114,6 +114,7 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.venv-grid
 env/
 venv/
 ENV/
@@ -170,4 +171,7 @@ run_dataset*/
 csv*/
 logs*/
 static/plots*/
-checkpoints/
+checkpoints*/
+
+models/
+results/*

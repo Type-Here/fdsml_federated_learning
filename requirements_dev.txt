@@ -52,11 +52,26 @@ itsdangerous==2.2.0
 click==8.1.7
 bidict==0.23.1
 
+# --- input corruption (inference-time shift) ---
+# Building the corrupted test set is pure numpy + PIL, so it runs here, not on
+# the GPU machine. Two constraints that are not obvious:
+#
+#   setuptools<81   `imagecorruptions` imports `pkg_resources`, removed in
+#                   setuptools 81. Without the cap the import fails outright.
+#   numpy stays at  a bare `pip install imagecorruptions` pulls numpy 2.x and
+#   1.26.4          breaks the pin above. Install it in the same command as
+#                   the pin, or reinstall numpy afterwards.
+#
+# scikit-image 0.26 renamed a keyword two corruptions still pass; iot/
+# corruption_shim.py translates it at runtime, so no version cap is needed.
+imagecorruptions==1.1.2
+scikit-image==0.26.0
+setuptools<81
+
 # --- testing ---
 pytest==8.2.2
 
-# Deliberately NOT here (see requirements_gpu.txt): torch, torchvision,
-# imagecorruptions, thop.
+# Deliberately NOT here (see requirements_gpu.txt): torch, torchvision, thop.
 #
 # Dropped from the original requirements_linux.txt because nothing in the
 # codebase imports them: socketIO-client (abandoned 2016 package, unrelated
