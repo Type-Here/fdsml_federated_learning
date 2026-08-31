@@ -1,38 +1,38 @@
 {
   "ip_address": "127.0.0.1",
-  "port": 5001,
-  "base_csv_path": "csv",
-  "base_log_path": "logs",
-  "base_plot_path": "static/plots",
-  "base_split_data_path": "run_dataset",
+  "port": 5201,
+  "base_csv_path": "csv_smoke_fipa",
+  "base_log_path": "logs_smoke_fipa",
+  "base_plot_path": "static/plots_smoke_fipa",
+  "base_split_data_path": "run_dataset_smoke_fipa",
   "early_stop_patience": 5,
   "weighted_aggregation": true,
   "num_parallel_executions": 1,
   "seed": 42,
+  "max_units_per_class": 2,
   "datasets": [
     {
-      "name": "gtsrb",
+      "name": "gtsrb_smoke_fipa",
       "path": "dataset/gtsrb/train",
       "num_classes": 43
     }
   ],
   "common_search_space": {
     "encryption_mode": [
-      "no_encryption"
+      "no_encryption",
+      "direct_encrypted_update"
     ],
     "device": [
       "cuda"
     ],
     "global_epoch": [
-      30
+      3
     ],
     "local_epoch": [
-      1,
-      5
+      1
     ],
     "num_clients": [
-      4,
-      8
+      4
     ],
     "models_percentage": [
       1
@@ -44,26 +44,22 @@
       16
     ],
     "aggregation_algorithm": [
-      "FedAvg",
-      "FedProx",
       "FIPA"
     ],
     "fedprox_mu": [
-      0.05
+      0.0
     ],
     "partition_strategy": [
       "dirichlet"
     ],
     "dirichlet_alpha": [
-      0.1,
-      0.5,
-      1.0
+      0.5
     ],
     "partition_unit": [
       "track"
     ],
     "fipa_warmup_rounds": [
-      3
+      1
     ],
     "fipa_rank": [
       5
@@ -81,24 +77,7 @@
         128
       ],
       "num_custom_layers": [
-        2
-      ]
-    },
-    "ConvNet": {
-      "image_size": [
-        128
-      ],
-      "convnet_hidden1": [
-        32
-      ],
-      "convnet_hidden2": [
-        16
-      ],
-      "local_epoch": [
         1
-      ],
-      "num_clients": [
-        4
       ]
     }
   }

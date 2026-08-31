@@ -16,7 +16,7 @@ Contents:
   - the algorithm families, i.e. which server-side weighting rule each
     `aggregation_algorithm` belongs to;
   - `client_denominator`, the single source of truth for B2;
-  - `label_distribution_discrepancy`, the `d_k` of FedDisco (WP2.1).
+  - `label_distribution_discrepancy`, the `d_k` of FedDisco.
 """
 
 from typing import Sequence
@@ -57,11 +57,83 @@ KNOWN_ALGORITHMS = SUM_WEIGHTED_BY_SIZE + SERVER_RETURNS_FINAL_MODEL
 # "Divide by nothing", expressed as a number the client can always divide by.
 NO_RESCALING = 1.0
 
+# Algorithms that do not run from round 0, but only after a warmup phase in
+# which plain FedAvg is used instead.
+#
+# FIPA is the only one so far, and for a reason specific to it: its weights come
+# from the curvature of the loss, and a low-rank estimate of that curvature says
+# something useful only near a minimum. At round 0 the parameters are far from
+# any optimum, the Fisher information matrix is dominated by whichever direction
+# the initialization happened to make steep, and preconditioning by it amplifies
+# noise. Hence, the two-phase structure: FedAvg to get close, FIPA to refine.
+NEEDS_WARMUP = ("FIPA",)
+
+# What a warming-up algorithm falls back to. FedAvg and not FedProx because the
+# warmup is meant to be the neutral baseline the refinement is measured against.
+WARMUP_ALGORITHM = "FedAvg"
+
+# Algorithms whose clients send a *delta* rather than absolute parameters, so
+# the server has to remember theta - the parameters it broadcast - to add the
+# aggregated increment back onto.
+#
+# Deliberately not the same set as SERVER_RETURNS_FINAL_MODEL, even though FIPA
+# is in both. FedDisco's output is also a finished model, but its clients send
+# absolute weights and its server never needs to know what it broadcast; making
+# it take the snapshot too would break the moment it runs encrypted, where
+# `current_weights` holds Paillier ciphertexts that cannot be divided at all.
+NEEDS_GLOBAL_WEIGHTS = ("FIPA",)
+
+
+def effective_algorithm(algorithm: str, round_number: int,
+                        warmup_rounds: int = 0) -> str:
+    """Which aggregation rule actually governs `round_number`.
+
+    The single answer to a question two different files ask. The client needs it
+    to decide whether to spend an extra pass collecting gradients; the server
+    needs it to pick the aggregation branch and, crucially, the denominator it
+    puts in the round payload. If the two ever disagreed by one round, the
+    clients would divide a finished model by `N`, or fail to divide a weighted
+    sum - and neither shows up as an error, only as "FIPA does not converge".
+
+    Rounds are numbered from 0 (`FederatedServer.current_round`), so with
+    `global_epoch = 10` and `fipa_warmup_rounds = 8`:
+
+        round   0 1 2 3 4 5 6 7 | 8 9
+        rule    F F F F F F F F | P P      F = FedAvg (warmup), P = FIPA
+
+    i.e. `warmup_rounds` is a count of warmup rounds, and the refinement phase
+    is the last `global_epoch - warmup_rounds` of them.
+
+    Args:
+        algorithm: the configured `aggregation_algorithm`.
+        round_number: the round being prepared or aggregated, from 0.
+        warmup_rounds: config key `fipa_warmup_rounds`. 0 means the algorithm
+            runs from the very first round.
+
+    Returns:
+        `algorithm` itself for everything that does not warm up, or for a round
+        past the warmup; `WARMUP_ALGORITHM` during the warmup.
+
+    Raises:
+        ValueError: for an unknown algorithm, or a negative `warmup_rounds`.
+    """
+    if algorithm not in KNOWN_ALGORITHMS:
+        raise ValueError(
+            f"Unknown aggregation algorithm '{algorithm}'. Known: "
+            f"{', '.join(KNOWN_ALGORITHMS)}."
+        )
+    if warmup_rounds < 0:
+        raise ValueError(f"warmup_rounds must be >= 0, got {warmup_rounds}.")
+
+    if algorithm in NEEDS_WARMUP and round_number < warmup_rounds:
+        return WARMUP_ALGORITHM
+    return algorithm
+
 
 def client_denominator(algorithm: str, total_training_size: int) -> float:
     """What `_process_server_weights` must divide the server's payload by.
 
-    This is B2. The server used to send only `total_training_size` and the
+    The server used to send only `total_training_size` and the
     client always divided by it, which silently assumes every algorithm is
     FedAvg-shaped. Sending the denominator explicitly lets one client handle
     every rule without knowing anything about them.
@@ -78,12 +150,12 @@ def client_denominator(algorithm: str, total_training_size: int) -> float:
     Raises:
         ValueError: for an algorithm nobody has classified yet. Failing loudly
             is the point: a run that silently defaults to FedAvg scaling would
-            produce a mislabelled result rather than an error.
+            produce a mislabeled result rather than an error.
 
     Round 0 caveat: the server calls this before any aggregation has happened,
     when `total_training_size_in_round` is still 0. The size-weighted family
     therefore gets 0.0, and the client treats that as "use the weights as is" -
-    which is the correct behaviour, because round 0's payload is the initial
+    which is the correct behavior, because round 0's payload is the initial
     weights, not a sum. Do not "fix" the zero without re-checking round 0.
     """
     if algorithm in SUM_WEIGHTED_BY_SIZE:
@@ -101,8 +173,7 @@ def client_denominator(algorithm: str, total_training_size: int) -> float:
 def label_distribution_discrepancy(samples_per_class: Sequence[float]) -> float:
     """`d_k`: how far client k's label distribution is from a uniform one.
 
-    This is WP2.1, the quantity FedDisco adds on top of the dataset size. The
-    formula:
+    The quantity FedDisco adds on top of the dataset size. The formula:
 
         D_k = n_k_per_class / sum(n_k_per_class)        the client's label
                                                         distribution, sums to 1

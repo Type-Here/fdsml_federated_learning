@@ -16,7 +16,7 @@
 # ON GOOGLE COLAB: do NOT install this file as-is.
 # Colab ships its own torch + numpy; re-pinning numpy==1.26.4 breaks the
 # preinstalled CUDA torch. Install only what is missing:
-#   !pip install phe==1.5.0 flask-socketio==5.1.1 python-socketio==5.3.0 \
+#   !pip install phe==1.5.0 gmpy2==2.3.1 flask-socketio==5.1.1 python-socketio==5.3.0 \
 #                eventlet==0.35.2 imagecorruptions thop
 # and leave numpy / torch / torchvision / scikit-learn alone.
 # ------------------------------------------------------------
@@ -33,6 +33,13 @@ tqdm==4.66.4
 
 # --- partially homomorphic encryption (Paillier) ---
 phe==1.5.0
+# Optional for `phe`, but not optional for us: without it every modular
+# exponentiation runs in pure Python. Measured on the encrypted FIPA round
+# (p*r ciphertext multiplications per client), it is an 8.6x difference -
+# 135 s against 16 s for a 4-client round on the ResNet18 head. The server
+# does that work inside a Socket.IO handler, so it is also how long the
+# server stops answering its clients.
+gmpy2==2.3.1
 
 # --- web server & socket stack ---
 Flask==2.0.3

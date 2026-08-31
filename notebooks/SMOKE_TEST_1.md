@@ -45,7 +45,7 @@ Two configurations run sequentially: `no_encryption`, then
 
 # 2. Install only what Colab is missing. Do NOT install requirements_gpu.txt
 #    as-is: re-pinning numpy==1.26.4 breaks the preinstalled CUDA torch.
-!pip install -q phe flask-socketio python-socketio eventlet
+!pip install -q phe gmpy2 flask-socketio python-socketio eventlet
 
 # 3. Build the dataset (downloads ~200 MB, writes dataset/gtsrb/train/00000..00042)
 !python datasets_prep/prepare_gtsrb.py --splits train

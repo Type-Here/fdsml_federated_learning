@@ -10,6 +10,10 @@ import threading
 from model_manager import ModelManager
 from utils import object_to_pickle_string, pickle_string_to_object, encrypt_weights, decrypt_weights
 
+import fipa
+import fipa_encrypted
+from model_manager_ext import ExtendedModelManager
+
 
 class ContextFilter(logging.Filter):
     """A logging filter to add client_id context to log records."""
@@ -37,37 +41,65 @@ class FederatedClient:
         self.logger: logging.LoggerAdapter = self._setup_logger()
 
         self.encryption_mode: str = self.config.get('encryption_mode', 'none')
+
         if self.encryption_mode != 'no_encryption':
             self.logger.info("Encryption enabled. Keys will be requested from the Trusted Authority.")
             self.paillier_pubkey = None
             self.paillier_privkey = None
             self.keys_received_event = threading.Event()
 
-        self.sio = socketio.Client(logger=True, request_timeout=10, reconnection=True)
+        # Bounded reconnection, not endless. `reconnection_attempts=0` (the
+        # default) means "retry for ever", and the end of a run is precisely a
+        # moment where the server goes away: if the shutdown event is missed for
+        # any reason the client reconnects until killed by hand, `sio.wait()`
+        # never returns, the client thread never joins, and the worker never
+        # dequeues the next configuration - the run finishes, the process does
+        # not. Giving up turns that hang into a run that ends and writes its CSV
+        # row. A dropped client cannot be replaced mid-round anyway: the server
+        # sampled it for this round and waits for an update only it can send.
+        self.sio = socketio.Client(
+            logger=True, request_timeout=10, reconnection=True,
+            reconnection_attempts=int(self.config.get('reconnection_attempts', 10)),
+        )
         self._register_event_handlers()
         self.connect_to_server()
 
     def _setup_logger(self) -> logging.LoggerAdapter:
         worker_id = self.config.get('worker_id', 'N/A')
-        logger_name = f"FederatedClient-W{worker_id}"
+        # One logger per client, not one per worker. A worker runs all of its
+        # clients as threads in the same process, so a name shared across them
+        # meant a single file handler - created by whichever client was built
+        # first - collected every client's lines and stamped them all with that
+        # client's id.
+        logger_name = f"FederatedClient-W{worker_id}-{self.client_id}"
         base_logger = logging.getLogger(logger_name)
 
-        if not base_logger.hasHandlers():
-            datestr = time.strftime('%d%m')
-            timestr = time.strftime('%m%d%H%M')
-            log_dir_base = self.config.get('log_dir', 'logs')
-            log_dir = os.path.join(log_dir_base, datestr, "FL-Client-LOG")
-            os.makedirs(log_dir, exist_ok=True)
-            file_handler = logging.FileHandler(os.path.join(log_dir, f'{timestr}_{self.client_id}.log'))
-            file_handler.setLevel(logging.INFO)
-            stream_handler = logging.StreamHandler()
-            stream_handler.setLevel(logging.WARN)
-            formatter = logging.Formatter('%(asctime)s - %(client_id)s - %(levelname)s - %(message)s')
-            file_handler.setFormatter(formatter)
-            stream_handler.setFormatter(formatter)
-            base_logger.setLevel(logging.INFO)
-            base_logger.addHandler(file_handler)
-            base_logger.addHandler(stream_handler)
+        # A worker dequeues several configurations one after the other in the
+        # same process, so this logger may still hold the previous run's file
+        # handler. Drop it, or the second run's lines are appended to the first
+        # run's file and the two become impossible to tell apart.
+        for stale_handler in list(base_logger.handlers):
+            base_logger.removeHandler(stale_handler)
+            stale_handler.close()
+
+        datestr = time.strftime('%d%m')
+        # Seconds included: two configurations dequeued by the same worker
+        # within the same minute would otherwise reopen the same file in
+        # append mode, undoing the handler reset above.
+        timestr = time.strftime('%m%d%H%M%S')
+        log_dir_base = self.config.get('log_dir', 'logs')
+        log_dir = os.path.join(log_dir_base, datestr, "FL-Client-LOG")
+        os.makedirs(log_dir, exist_ok=True)
+        file_handler = logging.FileHandler(os.path.join(log_dir, f'{timestr}_{self.client_id}.log'))
+        file_handler.setLevel(logging.INFO)
+        stream_handler = logging.StreamHandler()
+        stream_handler.setLevel(logging.WARN)
+        formatter = logging.Formatter('%(asctime)s - %(client_id)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(formatter)
+        stream_handler.setFormatter(formatter)
+        base_logger.setLevel(logging.INFO)
+        base_logger.addHandler(file_handler)
+        base_logger.addHandler(stream_handler)
 
         adapter = logging.LoggerAdapter(base_logger, {'client_id': self.client_id})
         log_filter = ContextFilter(self.client_id)
@@ -153,13 +185,26 @@ class FederatedClient:
     def _on_connect(self):
         self.logger.info("Successfully connected with SID: %s", self.sio.sid)
 
-    def _on_disconnect(self):
-        self.logger.info("Disconnected from the server."); self.sio.disconnect()
+    def _on_disconnect(self, reason: str = None):
+        # `reason` is optional because python-socketio only started passing it
+        # to disconnect handlers in 5.12; older pinned versions call this with
+        # no argument at all.
+        #
+        # Do not call self.sio.disconnect() here. This handler runs inside the
+        # read loop thread, and disconnect() joins that very thread, which
+        # raises "cannot join current thread". There is nothing to close
+        # anyway: by the time this fires the connection is already gone.
+        self.logger.info("Disconnected from the server. Reason: %s", reason or "not reported")
 
     def _on_reconnect(self):
         self.logger.info("Reconnected to the server.")
 
-    def _on_shutdown(self):
+    def _on_shutdown(self, data: Dict = None):
+        # The server sends this event twice at the end of a run: once broadcast
+        # to every registered client with no payload, and once to whoever
+        # triggered the final aggregation, carrying the Trusted Authority
+        # address. Accept both shapes, or the second one raises inside the
+        # handler and only that client stays connected.
         self.logger.info("Received shutdown signal."); self.sio.disconnect()
 
     def _on_init(self, data: Dict):
@@ -192,8 +237,10 @@ class FederatedClient:
     def _initialize_model_and_report_ready(self):
         self.logger.info("Initializing local model.")
 
-        # --- MODIFICA CHIAVE: Istanza del nuovo ModelManager ---
-        self.local_model = ModelManager(
+        # `ExtendedModelManager` behaves exactly like `ModelManager` unless
+        # `collect_gradient_factors` is called, which only FIPA rounds do. Using
+        # it unconditionally keeps this to one line instead of a branch.
+        self.local_model = ExtendedModelManager(
             config=self.config,
             dataset_path=self.dataset_path
         )
@@ -221,6 +268,96 @@ class FederatedClient:
         worker_thread.daemon = True
         worker_thread.start()
 
+    def _round_algorithm(self, data: Dict) -> str:
+        """Which aggregation rule governs this round.
+
+        The server decides and says so in the round payload, because the rule
+        can change mid-run: FIPA spends its first `fipa_warmup_rounds` rounds
+        behaving as FedAvg (`aggregation_policy.effective_algorithm`). Deciding
+        it here instead would mean two files computing the same warmup boundary
+        and one of them eventually getting it wrong by a round - which produces
+        no error, only a model divided by N when it should not have been.
+
+        The fallback is for a server that predates this key.
+        """
+        return data.get('aggregation_algorithm',
+                        self.config.get("aggregation_algorithm", "FedAvg"))
+
+    def _build_fipa_update(self, global_weights, local_weights, data: Dict) -> Dict:
+        """The payload of a FIPA round: the movement and the curvature.
+
+        Common to both routes:
+
+            fipa_U       U_m, the top-r curvature directions, (p, r) float32.
+            fipa_lambda  L_m, the matching eigenvalues, (r,) float32.
+            fipa_explained_variance
+                         how much of the gradients' variance those r directions
+                         account for. Not used by the aggregation - it is a
+                         result: it is what tells us whether `fipa_rank` is big
+                         enough on this model and this data.
+
+        And then the client's movement, in the only form the route allows:
+
+            plaintext    weights      Delta_m = theta_m - theta_global, in the
+                                      same list-of-arrays shape as ordinary
+                                      weights, so the wire format does not
+                                      change type between rounds.
+                         payload_kind 'delta'.
+
+            encrypted    fipa_z       Enc(U_m^T Delta_m), **r ciphertexts**, at
+                                      the fixed exponent `fipa_encrypted`
+                                      pins both sides of the server's
+                                      multiplication to.
+                         payload_kind 'fipa_z'.
+                         weights      an empty list - the server unpickles that
+                                      key unconditionally
+                                      (`federated_server._on_client_update`),
+                                      and there is no delta to put in it.
+
+        **Encrypted FIPA encrypts (by default) 5 numbers where encrypted FedAvg encrypts
+        142379.** That is not a saving taken at the cost of accuracy: in
+        `B_m Delta_m = a_m H^+ U_m diag(L_m) (U_m^T Delta_m)` every occurrence of
+        the delta sits behind `U_m^T`, so the part left at home is the part the
+        server would multiply by zero. See `fipa.project_delta`.
+
+        Why the client computes the delta and not the server: the server could
+        subtract, since it knows what it broadcast - but only in plaintext.
+        Under encryption it holds ciphertexts and no public key, so it cannot
+        form `-theta_global` at all. The subtraction is free here anyway, both
+        vectors are already in this method.
+        """
+        global_flat, _ = fipa.flatten_weights(global_weights)
+        local_flat, shapes = fipa.flatten_weights(local_weights)
+        delta_flat = local_flat - global_flat
+
+        directions, curvature, explained = self.local_model.collect_gradient_factors(
+            batch_size=data['batch_size'],
+            rank=int(self.config.get('fipa_rank', 5)),
+            max_batches=self.config.get('fipa_grad_batches'),
+            random_state=int(self.config.get('seed', 42)),
+            logger=self.logger,
+        )
+        payload = {
+            'fipa_U': object_to_pickle_string(directions),
+            'fipa_lambda': object_to_pickle_string(curvature),
+            'fipa_explained_variance': explained,
+        }
+
+        if self.encryption_mode == 'no_encryption':
+            payload['weights'] = object_to_pickle_string(
+                fipa.unflatten_weights(delta_flat, shapes))
+            payload['payload_kind'] = 'delta'
+            return payload
+        # Else encrypted:
+        projection = fipa.project_delta(directions, delta_flat)
+        self.logger.info("Encrypting the %d-value curvature projection instead "
+                         "of the %d-parameter delta.", projection.size, delta_flat.size)
+        payload['fipa_z'] = object_to_pickle_string(
+            fipa_encrypted.encrypt_projection(self.paillier_pubkey, projection))
+        payload['payload_kind'] = 'fipa_z'
+        payload['weights'] = object_to_pickle_string([])
+        return payload
+
     def _update_worker(self, data: Dict):
         try:
             self.logger.info("Worker thread started for round %s.", data['round_number'])
@@ -231,18 +368,13 @@ class FederatedClient:
 
             self.local_model.set_weights(averaged_weights)
 
+            algorithm = self._round_algorithm(data)
             _, train_map, train_loss, train_size = self.local_model.train(
                 epochs=data['epochs'], lr=data['learning_rate'], batch_size=data['batch_size'],
-                algorithm=self.config.get("aggregation_algorithm", "FedAvg"),
+                algorithm=algorithm,
                 global_weights=averaged_weights, mu=self.config.get("fedprox_mu", 0.0)
             )
             local_weights = self.local_model.get_weights()
-
-            if self.encryption_mode != 'no_encryption':
-                weights_to_send = encrypt_weights(self.paillier_pubkey, local_weights,
-                                                  encryption_mode=self.encryption_mode, logger=self.logger)
-            else:
-                weights_to_send = local_weights
 
             response = {
                 'client_id': self.client_id,
@@ -251,8 +383,29 @@ class FederatedClient:
                 train_map['f1_score'],
                 'avg_acc': np.mean(list(train_map['accuracy'])) if isinstance(train_map['accuracy'], list) else
                 train_map['accuracy'],
-                'train_size': train_size, 'weights': object_to_pickle_string(weights_to_send)
+                'train_size': train_size,
             }
+
+            # A FIPA round replaces the absolute weights with the client's
+            # movement and adds the curvature factors. The branch comes *before*
+            # any encryption, and that ordering is the point: an encrypted FIPA
+            # round encrypts the r-value projection, so encrypting the whole
+            # parameter vector first would pay for 142379 Paillier encryptions
+            # and then throw them away. A warmup round takes the other branch
+            # and is byte for byte what it was before this feature existed.
+            if algorithm == 'FIPA':
+                self.logger.info("Round %s is a FIPA refinement round: collecting "
+                                 "curvature factors.", data['round_number'])
+                response.update(self._build_fipa_update(averaged_weights, local_weights, data))
+            else:
+                if self.encryption_mode != 'no_encryption':
+                    weights_to_send = encrypt_weights(self.paillier_pubkey, local_weights,
+                                                      encryption_mode=self.encryption_mode, logger=self.logger)
+                else:
+                    weights_to_send = local_weights
+                response['weights'] = object_to_pickle_string(weights_to_send)
+                response['payload_kind'] = 'weights'
+
             self.logger.info("Worker thread: Sending client update for round %s.", data['round_number'])
             self.sio.emit('client_update', response)
             self.logger.info("--- Worker thread Round %s Training Summary ---", data['round_number'])

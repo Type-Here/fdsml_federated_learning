@@ -168,11 +168,14 @@ class FederatedServer:
             'round_number': self.current_round,
             'current_weights': current_weights_pickled,
             'total_training_size': self.total_training_size_in_round,
-            # What the client must divide the payload by. FedAvg-style rules
-            # send N (the server summed, the client averages); rules whose
-            # server output is already the finished model send 1.0.
-            'aggregation_denominator': self.aggregator.client_denominator(
-                self.total_training_size_in_round
+            # Two keys about two different rounds: which rule governs the round
+            # about to run (it can change mid-run, FIPA warms up as FedAvg), and
+            # what the client must divide this payload by - which describes what
+            # the *previous* aggregation left in `current_weights`. The
+            # aggregator owns both, and snapshots the parameters it is
+            # broadcasting for the rules that need them.
+            **self.aggregator.begin_round(
+                self.current_round, self.total_training_size_in_round
             ),
         }
 
@@ -210,15 +213,20 @@ class FederatedServer:
         # here rather than once at startup so the mapping is always current.
         self.aggregator.register_client_stats(self.client_stats)
 
+        # The *effective* algorithm, not the configured one: a rule that warms
+        # up spends its first rounds as plain FedAvg, and the clients were told
+        # so in the round payload. If the two ever disagreed by one round, the
+        # server would aggregate deltas as if they were parameters.
+        algorithm = self.aggregator.effective_algorithm(self.current_round)
+
         if self.encryption_mode == 'no_encryption':
-            self.logger.info("Aggregating plaintext updates.")
-            self.aggregator.aggregate_weights(
-                self.client_updates_this_round,
-                self.config['aggregation_algorithm']
-            )
+            self.logger.info("Aggregating plaintext updates with '%s'.", algorithm)
+            self.aggregator.aggregate_weights(self.client_updates_this_round, algorithm)
         else:  # Encrypted modes
-            self.logger.info("Aggregating encrypted updates.")
-            self.aggregator.aggregate_encrypted_updates(self.client_updates_this_round)
+            self.logger.info("Aggregating encrypted updates with '%s'.", algorithm)
+            self.aggregator.aggregate_encrypted_updates(
+                self.client_updates_this_round, algorithm
+            )
 
         if self.config.get('weighted_aggregation', True):
             self.aggregator.aggregate_train_loss_weighted(train_losses, train_sizes, self.current_round)
@@ -230,7 +238,15 @@ class FederatedServer:
         # self.logger.info("Shutting down the server.")
         ta_address = f"http://{self.config['ip_address']}:{self.config['ta_port']}"
         emit('shutdown', {'ta_address': ta_address})
-        time.sleep(1)
+        # socketio.sleep, not time.sleep. The server runs on eventlet without
+        # monkey patching, so every connection is a green thread on one OS
+        # thread: the real time.sleep blocks the whole hub, the queued
+        # 'shutdown' packets are never written to the sockets, and stop() below
+        # then tears the server down before any client hears about it. The
+        # clients see a bare connection drop instead and, having reconnection
+        # enabled, retry for ever - the run finishes and the process hangs.
+        # socketio.sleep yields to the hub, which flushes the writes first.
+        self.socketio.sleep(1)
         # func = request.environ.get('werkzeug.server.shutdown')
         # if func is None:
         #     self.logger.error('Cannot shut down server. Not running with the Werkzeug Server.')
@@ -327,7 +343,11 @@ class FederatedServer:
         # 4. Avvia il primo round di training
         self.logger.info("Initialization complete. Starting federated training process.")
         # Aggiungiamo un piccolo ritardo per assicurarci che i client processino la calibrazione
-        time.sleep(10)
+        # Cooperative sleep for the same reason as in _shutdown_server: a real
+        # time.sleep here blocks the event loop, so the calibration broadcast
+        # this delay exists to give the clients time to process is not even sent
+        # until the delay is over.
+        self.socketio.sleep(10)
         self._start_next_training_round()
 
     def _on_client_update(self, data: Dict):
@@ -367,6 +387,13 @@ class FederatedServer:
                 self._trigger_global_evaluation()
 
     def _on_client_eval(self, data: Dict):
+        # Set inside the lock, acted on outside it: _shutdown_server now yields
+        # to the event loop so the shutdown packets get written, and yielding
+        # while holding this lock would be a deadlock rather than a pause. The
+        # lock is an ordinary threading.Lock and eventlet is not monkey patched,
+        # so a second handler waiting on it blocks the one OS thread the hub
+        # runs on - and the sleeping holder could never be scheduled again.
+        shutdown_after_release = False
         with self.lock:
             self.logger.info("Received evaluation from client %s.", request.sid)
             self.client_evaluations_this_round.append(data)
@@ -390,7 +417,10 @@ class FederatedServer:
 
                     for sid in self.registered_clients:
                         emit("shutdown", room=sid)
-                    self._shutdown_server()
+                    shutdown_after_release = True
                 else:
                     self.logger.info("Proceeding to the next round.")
                     self._start_next_training_round()
+
+        if shutdown_after_release:
+            self._shutdown_server()
