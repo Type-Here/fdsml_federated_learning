@@ -77,10 +77,28 @@ class FederatedClient:
 
     def _process_server_weights(self, data: Dict):
         """
-        Processes weights from the server: decrypts if needed, then averages the sum.
+        Processes weights from the server: decrypts if needed, then rescales.
+
+        The server sends a weighted *sum* and the client turns it into the
+        model, because under Paillier the server can only add ciphertexts and
+        scale them by plaintext numbers - the division has to happen after
+        decryption, here.
+
+        What to divide by depends on the aggregation rule, so the server now
+        says it explicitly in `aggregation_denominator`:
+          - FedAvg / FedProx / FedLC: N, the total training size, turning
+            `sum_k n_k * W_k` into the average.
+          - FedDisco / FIPA: 1.0, because the server's output is already the
+            finished model and dividing again would shrink it.
+
+        The fallback to `total_training_size` keeps this working against a
+        server that has not been updated. A denominator of 0 means round 0,
+        whose payload is the initial weights rather than a sum: using them
+        unscaled is correct.
         """
         weights_pickled = data['current_weights']
-        total_size = data.get('total_training_size', 0)
+        denominator = data.get('aggregation_denominator',
+                               data.get('total_training_size', 0))
         weights_data = pickle_string_to_object(weights_pickled)
         plaintext_sum = None
 
@@ -103,10 +121,11 @@ class FederatedClient:
             self.logger.error(f"Unknown weights format received. Type: {type(first_element)}")
             return None
         # --- FINE MODIFICA ---
-        if total_size > 0:
-            return [w / total_size for w in plaintext_sum]
+        if denominator > 0:
+            self.logger.info("Rescaling server payload by denominator %.4f.", denominator)
+            return [w / denominator for w in plaintext_sum]
         else:
-            self.logger.warning("Total training size is 0. Using weights as is.")
+            self.logger.warning("Aggregation denominator is 0. Using weights as is.")
             return plaintext_sum
 
     def connect_to_server(self) -> None:
@@ -182,7 +201,14 @@ class FederatedClient:
         self.logger.info("Local model initialized. Calculating data stats...")
         samples_per_class = self.local_model.get_samples_per_class()
         self.logger.info("Stats calculated. Sending 'client_ready' to the main server.")
-        self.sio.emit('client_ready', {'samples_per_class': object_to_pickle_string(samples_per_class)})
+        # `client_id` is the name of this client's data directory (`client_0`).
+        # Unlike the Socket.IO session id it survives a reconnect, so the server
+        # can key the label distributions by it and pair them with the weight
+        # updates that arrive later, in a different order.
+        self.sio.emit('client_ready', {
+            'client_id': self.client_id,
+            'samples_per_class': object_to_pickle_string(samples_per_class),
+        })
 
     def _on_distribute_calibration(self, data: Dict):
         self.logger.info("Received static calibration term from the server.")
@@ -219,6 +245,7 @@ class FederatedClient:
                 weights_to_send = local_weights
 
             response = {
+                'client_id': self.client_id,
                 'round_number': data['round_number'], 'train_loss': train_loss,
                 'avg_f1': np.mean(list(train_map['f1_score'])) if isinstance(train_map['f1_score'], list) else
                 train_map['f1_score'],

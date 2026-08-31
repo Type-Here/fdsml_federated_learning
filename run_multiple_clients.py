@@ -4,7 +4,7 @@ import threading
 import json
 from typing import Dict, List
 
-from data_splitter import DatasetSplitter
+from data_splitter_ext import PartitionedDatasetSplitter
 from federated_client import FederatedClient
 
 def load_json(filename: str) -> Dict:
@@ -35,10 +35,13 @@ def main(config: Dict) -> None:
     source_images_dir = config['dataset_path'] # <-- Modifica chiave
 
     print(f"Preparing to split the dataset from '{source_images_dir}' for {num_clients} clients into '{splitting_dir}'.")
-    splitter = DatasetSplitter(
+    # Reads `partition_strategy`, `dirichlet_alpha`, `partition_unit` and `seed`
+    # from the config; with none of them set it reproduces the received
+    # stratified IID split exactly.
+    splitter = PartitionedDatasetSplitter.from_config(
+        config,
         output_base_dir=splitting_dir,
         source_images_dir=source_images_dir,
-        num_clients=num_clients
     )
     splitter.split_dataset()
     print("Dataset splitting complete.")

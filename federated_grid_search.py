@@ -1,4 +1,5 @@
 import json
+import sys
 import threading
 import time
 import itertools
@@ -13,6 +14,11 @@ from typing import Dict, List, Any, Generator, Set, FrozenSet, Tuple
 import multiprocessing
 import queue
 
+from config_fingerprint import (
+    EXTRA_FINGERPRINT_KEYS,
+    get_config_fingerprint,
+    normalize_partition_keys,
+)
 from trusted_authority import TrustedAuthority
 from seeding import seed_from_config
 import federated_server
@@ -24,13 +30,6 @@ import run_multiple_clients
 DEFAULT_NUM_PARALLEL_EXECUTIONS = 12
 GRID_SEARCH_CONFIG_PATH = 'grid_search_config.json'
 VERBOSE_DUPLICATE_CHECK = False
-
-def get_config_fingerprint(config: Dict, keys: Set[str]) -> FrozenSet[Tuple[str, str]]:
-    fingerprint_items = []
-    for key in sorted(list(keys)):
-        if key in config and config[key] is not None and config[key] != '':
-            fingerprint_items.append((key, str(config[key])))
-    return frozenset(fingerprint_items)
 
 def wait_for_server_ready(url, timeout=60):
     start_time = time.time()
@@ -182,8 +181,15 @@ def run_grid_search_worker(
             task_queue.task_done()
 
 
-def main():
-    base_grid_config = load_json(GRID_SEARCH_CONFIG_PATH)
+def main(config_path: str = GRID_SEARCH_CONFIG_PATH):
+    """Run the grid described by `config_path`.
+
+    The path is a parameter so the smoke configuration can be run without
+    editing this file, which matters on Colab where the repo is a fresh clone:
+    `python federated_grid_search.py smoke_config.json`.
+    """
+    print(f"Loading grid configuration from '{config_path}'.")
+    base_grid_config = load_json(config_path)
     csv_lock = multiprocessing.Lock()
     task_queue = multiprocessing.JoinableQueue()
     pc_name = PCNAME.name
@@ -206,7 +212,15 @@ def main():
     all_possible_search_keys = set(common_search_space.keys())
     for model_params in model_specific_search_space.values():
         all_possible_search_keys.update(model_params.keys())
-    all_possible_search_keys.update(['dataset_name', 'model_name'])
+    # The partitioning keys are listed explicitly so they count towards the
+    # fingerprint even when a config declares them as fixed parameters rather
+    # than as search axes. Without this, two runs differing only in
+    # `dirichlet_alpha` would look identical and the second would be skipped.
+    all_possible_search_keys.update(EXTRA_FINGERPRINT_KEYS)
+    # NOTE: `seed` is deliberately NOT fingerprinted. Adding it would make every
+    # row the lab already produced (which has no seed column) differ from a new
+    # run, re-queueing the entire previous grid. If we ever want seed-variance
+    # runs, that needs a backfill of the default onto the CSV rows first.
 
     if os.path.exists(shared_csv_path) and os.path.getsize(shared_csv_path) > 0:
         with open(shared_csv_path, 'r', newline='', encoding='utf-8') as f:
@@ -215,6 +229,7 @@ def main():
                 # Normalizza la riga del CSV nello stesso modo in cui normalizzeremo le nuove config
                 model_name_from_row = row.get('model_name', '')
                 if row.get('aggregation_algorithm') != "FedProx": row['fedprox_mu'] = '0.0'
+                normalize_partition_keys(row)
                 if 'ResNet' in model_name_from_row or 'GoogLeNet' in model_name_from_row or 'AlexNet' in model_name_from_row:
                     row.setdefault('image_size', '224')
                     row.setdefault('convnet_hidden1', '-1')
@@ -247,6 +262,7 @@ def main():
                                                   f"\n[{total_generated_configs}] Generated Raw Config:\n{json.dumps(hyper_config, indent=2)}")
 
                 if hyper_config.get('aggregation_algorithm') != "FedProx": hyper_config['fedprox_mu'] = 0.0
+                normalize_partition_keys(hyper_config)
                 if 'ResNet' in model_name or 'GoogLeNet' in model_name or 'AlexNet' in model_name:
                     # setdefault, NOT assignment: this block only normalises keys so
                     # that fingerprints match across runs. A hard assignment here
@@ -301,4 +317,4 @@ def main():
 
 if __name__ == '__main__':
     multiprocessing.set_start_method('spawn', force=True)
-    main()
+    main(sys.argv[1] if len(sys.argv) > 1 else GRID_SEARCH_CONFIG_PATH)

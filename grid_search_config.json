@@ -9,6 +9,11 @@
   "weighted_aggregation": true,
   "datasets": [
     {
+      "name": "gtsrb",
+      "path": "dataset/gtsrb/train",
+      "num_classes": 43
+    },
+    {
       "name": "dataset_slices_sorted",
       "path": "dataset/dataset_slices_sorted",
       "num_classes": 2
@@ -136,6 +141,15 @@
     ],
     "fedprox_mu": [
       0.05
+    ],
+    "partition_strategy": [
+      "stratified"
+    ],
+    "dirichlet_alpha": [
+      0.5
+    ],
+    "partition_unit": [
+      "track"
     ]
   },
   "model_specific_search_space": {
