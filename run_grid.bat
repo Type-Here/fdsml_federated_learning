@@ -42,19 +42,39 @@ if "%WORKDIR:~-1%"=="\" set "WORKDIR=%WORKDIR:~0,-1%"
 
 REM --- 1. interpreter --------------------------------------------------------
 REM numpy 1.26.4 and scikit-learn 1.5.0 have no wheels beyond Python 3.12.
+REM Two ways of finding one, because a Windows install may have either: the "py"
+REM launcher, or a plain python.exe on PATH. Both resolve to a full path, so the
+REM rest of the script can quote it and stop caring which way it was found.
 set "PY="
 for %%V in (3.11 3.12) do (
     if not defined PY (
-        py -%%V -c "import sys" >nul 2>&1 && set "PY=py -%%V"
+        for /f "delims=" %%W in ('py -%%V -c "import sys;print(sys.executable)" 2^>nul') do set "PY=%%W"
     )
 )
 if not defined PY (
+    for %%C in (python python3) do (
+        if not defined PY (
+            %%C -c "import sys;sys.exit(0 if sys.version_info[:2] in ((3,11),(3,12)) else 1)" >nul 2>&1 && (
+                for /f "delims=" %%W in ('%%C -c "import sys;print(sys.executable)"') do set "PY=%%W"
+            )
+        )
+    )
+)
+if not defined PY (
+    echo.
     echo ERROR: Python 3.11 or 3.12 is required ^(numpy 1.26.4 has no wheel beyond 3.12^).
+    echo.
+    echo What this machine has:
+    py -0 2>nul || echo    the "py" launcher is not installed
+    where python 2>nul || echo    no python.exe on PATH
+    echo.
+    echo Install 3.11 from python.org, ticking "Add python.exe to PATH" in the
+    echo installer, then run this script again.
     goto :fail
 )
 where git >nul 2>&1 || (echo ERROR: git not found in PATH. & goto :fail)
 echo ==^> interpreter: %PY%
-%PY% -V
+"%PY%" -V
 
 REM --- 2. repository ---------------------------------------------------------
 if "%IN_PLACE%"=="1" (
@@ -78,7 +98,7 @@ set "VENV=%WORKDIR%\%VENV_NAME%"
 set "VPY=%VENV%\Scripts\python.exe"
 if not exist "%VPY%" (
     echo ==^> creating %VENV_NAME%
-    %PY% -m venv "%VENV%" || goto :fail
+    "%PY%" -m venv "%VENV%" || goto :fail
 )
 
 if not exist "%VENV%\.deps-ok" (
