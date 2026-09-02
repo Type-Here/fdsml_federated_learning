@@ -1,0 +1,117 @@
+# ============================================================
+# Conda / mamba environment for the NVIDIA training machine.
+#
+# The conda equivalent of requirements_gpu.txt. Same versions, split in two
+# because a conda environment is not a pip environment with a different
+# installer: the numerical core comes from conda-forge as compiled binaries,
+# everything else from pip.
+#
+#   conda env create -f environment_gpu.yml      (or: mamba env create -f ...)
+#   conda activate fdsml
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+#
+# Then run_grid.bat / run_grid.sh detect the active environment, see that torch
+# imports, and skip building their own .venv-grid.
+#
+# ------------------------------------------------------------
+# torch and torchvision are NOT here, on purpose. The CUDA wheels are not on
+# PyPI and not on conda-forge either: they live on download.pytorch.org behind
+# an --index-url, which cannot be expressed in this file without pointing pip
+# at that index for every other package too. So they are step 3 above, run
+# inside the activated environment.
+#
+# NOT on Google Colab. Colab ships its own torch and numpy; recreating this
+# environment there re-pins numpy to 1.26.4 under a CUDA torch built against a
+# different one. The header of requirements_gpu.txt has the Colab command.
+# ------------------------------------------------------------
+#
+# Keep in step with requirements_gpu.txt (plus the imagecorruptions /
+# scikit-image / setuptools pins of requirements_dev.txt, which the GPU file
+# leaves loose because it never builds the corrupted dataset). That file is the
+# source of truth for the versions; this one restates them because a conda
+# environment cannot be assembled from a requirements file without giving up
+# the conda-forge builds, which is the only reason to use conda here.
+# ============================================================
+
+name: fdsml
+
+channels:
+  - conda-forge
+
+dependencies:
+  # Python 3.11 and not later: numpy 1.26.4 and scikit-learn 1.5.0 have no
+  # wheels beyond 3.12, and the Flask stack pinned below is 2022-era.
+  - python=3.11
+  - pip
+
+  # `imagecorruptions` imports `pkg_resources`, removed in setuptools 81.
+  # Without this cap the import fails outright, at call time.
+  - setuptools<81
+
+  # --- numerical / data -----------------------------------------------------
+  # These come from conda-forge rather than pip because they are the compiled
+  # ones, and because installing them FIRST is what protects the numpy pin:
+  # pip (below) only installs what is missing, so `imagecorruptions`, whose
+  # requirement is a bare `numpy`, finds 1.26.4 already satisfied and leaves it
+  # alone. Installed the other way round it would pull numpy 2.x, where
+  # `imagecorruptions.fog` breaks on the removed `np.float_`.
+  - numpy=1.26.4
+  - pandas=2.2.1
+  - scikit-learn=1.5.0
+  - scipy=1.13.1
+  # matplotlib-base and not matplotlib: the full package drags in a Qt GUI
+  # stack that nothing here uses and that a headless training box cannot show.
+  - matplotlib-base=3.9.0
+  - pillow=10.3.0
+  - tqdm=4.66.4
+
+  # Optional for `phe`, but not optional for us: without it every modular
+  # exponentiation runs in pure Python. Measured on the encrypted FIPA round,
+  # it is an 8.6x difference - 135 s against 16 s for a 4-client round on the
+  # ResNet18 head - and the server does that work inside a Socket.IO handler,
+  # so it is also how long the server stops answering its clients.
+  # Not pinned to PyPI's 2.3.1: conda-forge carries a different version set,
+  # and any build satisfies `phe`, which only checks that it imports.
+  - gmpy2>=2.1
+
+  # --- testing --------------------------------------------------------------
+  - pytest=8.2.2
+
+  - pip:
+      # --- partially homomorphic encryption (Paillier) ---
+      - phe==1.5.0
+
+      # --- web server & socket stack ---
+      # Left to pip as one block: these are pure Python, and the exact 2022-era
+      # combination below is the one the received framework was written
+      # against. conda-forge does carry most of them, but not every one of
+      # these versions, and a solver free to move Werkzeug moves Flask with it.
+      - Flask==2.0.3
+      - Werkzeug==2.0.3
+      - Flask-SocketIO==5.1.1
+      - python-socketio==5.3.0
+      - python-engineio==4.9.1
+      - simple-websocket==1.0.0
+      - eventlet==0.35.2
+      - websocket-client==1.8.0
+      - requests==2.32.3
+
+      # --- template / CLI helpers pulled in by Flask ---
+      - Jinja2==3.1.3
+      - MarkupSafe==2.1.5
+      - itsdangerous==2.2.0
+      - click==8.1.7
+      - bidict==0.23.1
+
+      # --- input corruption (inference-time shift) ---
+      # scikit-image 0.26 renamed a keyword two corruptions still pass;
+      # iot/corruption_shim.py translates it at runtime, so no cap is needed -
+      # but import `corrupt` through the shim, never from the package.
+      # opencv-python is a dependency of imagecorruptions and is named here
+      # only so the version is written down rather than resolved on the day.
+      - imagecorruptions==1.1.2
+      - scikit-image==0.26.0
+      - opencv-python==4.11.0.86
+
+      # --- forward MAC counting for the edge-efficiency table ---
+      - thop==0.1.1.post2209072238
