@@ -17,6 +17,9 @@ REM    run_grid.bat grid_search_config_checkpoints.json
 REM
 REM  Run from inside a clone, it uses that clone and leaves git alone. Copied
 REM  out and run on its own, it clones into %WORKDIR% (default %USERPROFILE%\fdsml).
+REM
+REM  With a conda/mamba environment already activated and carrying torch (build
+REM  it from environment_gpu.yml), that environment is used and no .venv is built.
 REM ---------------------------------------------------------------------------
 
 set "REPO_URL=https://github.com/Type-Here/fdsml_federated_learning.git"
@@ -39,6 +42,33 @@ if exist "%~dp0federated_grid_search.py" (
 if not defined WORKDIR set "WORKDIR=%USERPROFILE%\fdsml"
 REM %~dp0 ends with a backslash; strip it so the paths built below stay clean.
 if "%WORKDIR:~-1%"=="\" set "WORKDIR=%WORKDIR:~0,-1%"
+
+REM --- 0. conda / mamba ------------------------------------------------------
+REM An already activated environment that carries torch is used as it is: the
+REM interpreter search and the virtual environment below are then pointless, and
+REM building a second copy of torch beside the one conda installed is worse than
+REM pointless. The repository and dataset steps still run.
+REM
+REM CONDA_PREFIX (the path of the active environment) and not CONDA_DEFAULT_ENV
+REM (its name): conda and mamba set both, micromamba only reliably the first.
+if defined CONDA_PREFIX (
+    REM The prefix and not the name, so the line stays informative under
+    REM micromamba, where CONDA_DEFAULT_ENV may be unset.
+    echo ==^> conda/mamba environment detected: %CONDA_PREFIX%
+    python -c "import torch" 2>nul
+    if not errorlevel 1 (
+        REM Resolved to a full path, so the rest of the script quotes it like any
+        REM other interpreter and stops caring where it came from.
+        for /f "delims=" %%W in ('python -c "import sys;print(sys.executable)"') do set "VPY=%%W"
+        set "USE_CONDA=1"
+        echo ==^> torch already present, skipping the virtual environment
+        goto :repo
+    ) else (
+        echo WARNING: torch is not installed here, falling back to %VENV_NAME%
+    )
+) else (
+    echo WARNING: no conda/mamba environment detected, using %VENV_NAME%
+)
 
 REM --- 1. interpreter --------------------------------------------------------
 REM numpy 1.26.4 and scikit-learn 1.5.0 have no wheels beyond Python 3.12.
@@ -72,11 +102,14 @@ if not defined PY (
     echo installer, then run this script again.
     goto :fail
 )
-where git >nul 2>&1 || (echo ERROR: git not found in PATH. & goto :fail)
 echo ==^> interpreter: %PY%
 "%PY%" -V
 
 REM --- 2. repository ---------------------------------------------------------
+:repo
+REM Checked here and not with the interpreter, because the conda path jumps
+REM straight to this label and still needs git.
+where git >nul 2>&1 || (echo ERROR: git not found in PATH. & goto :fail)
 if "%IN_PLACE%"=="1" (
     echo ==^> running inside an existing checkout, leaving git untouched
 ) else (
@@ -94,6 +127,8 @@ cd /d "%WORKDIR%" || goto :fail
 git log --oneline -1
 
 REM --- 3. environment --------------------------------------------------------
+REM Skipped when conda already provides torch: VPY is set above in that case.
+if "%USE_CONDA%"=="1" goto :start_grid
 set "VENV=%WORKDIR%\%VENV_NAME%"
 set "VPY=%VENV%\Scripts\python.exe"
 if not exist "%VPY%" (
@@ -125,6 +160,8 @@ if not exist "%VENV%\.deps-ok" (
 ) else (
     echo ==^> dependencies already installed ^(delete %VENV%\.deps-ok to redo them^)
 )
+
+:start_grid
 
 "%VPY%" -c "import torch;print('torch',torch.__version__,'| cuda',torch.cuda.is_available(),'|',torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
 
