@@ -16,7 +16,8 @@ Contents:
   - the algorithm families, i.e. which server-side weighting rule each
     `aggregation_algorithm` belongs to;
   - `client_denominator`, the single source of truth for B2;
-  - `label_distribution_discrepancy`, the `d_k` of FedDisco.
+  - `label_distribution_discrepancy`, the `d_k` of FedDisco;
+  - `feddisco_weights`, the rule built on top of it.
 """
 
 from typing import Sequence
@@ -216,3 +217,98 @@ def label_distribution_discrepancy(samples_per_class: Sequence[float]) -> float:
     distribution = counts / total
     uniform = np.full(counts.size, 1.0 / counts.size)
     return float(np.linalg.norm(distribution - uniform, ord=2))
+
+
+# ----------------------------------------------------------------------------
+# FedDisco: size, discounted by skew
+# ----------------------------------------------------------------------------
+# The two dials of the rule below, with the values the paper uses.
+#   `a` : how hard a skewed client is punished. 0 turns FedDisco back into
+#         FedAvg, because the discrepancy term disappears.
+#   `b` : a floor added to every score, so that a merely moderate client is not
+#         pushed below zero and dropped from the round altogether.
+FEDDISCO_DEFAULT_A = 0.5
+FEDDISCO_DEFAULT_B = 0.1
+
+
+def feddisco_weights(sizes: Sequence[float], discrepancies: Sequence[float],
+                     a: float = FEDDISCO_DEFAULT_A,
+                     b: float = FEDDISCO_DEFAULT_B) -> np.ndarray:
+    """The aggregation weights `w_k` of FedDisco, normalised to sum to 1.
+
+    What it says in plain terms: FedAvg gives a client a say proportional to how
+    much data it holds. FedDisco subtracts a penalty for how *skewed* that data
+    is - a client holding two of the 43 GTSRB classes is a poor witness of the
+    global task, so it should not weigh as much as its sample count alone says.
+
+    The formula, one line at a time:
+
+        p_k = n_k / N                   client k's share of the round's data
+        a_k = ReLU(p_k - a * d_k + b)   its score, floored at zero
+        w_k = a_k / sum_j a_j           normalised, so the weights sum to 1
+
+    Symbols:
+        n_k : client k's number of training samples (`train_size`).
+        N   : the sum of `n_k` over the clients in this round.
+        d_k : the label-distribution discrepancy, `label_distribution_discrepancy`
+              above - 0 for a perfectly balanced client, up to ~0.988 (for 43
+              classes) for one holding a single class.
+        a   : how strongly the skew is discounted.
+        b   : the floor that keeps a moderately skewed client in the round.
+              Note it also flattens the weights towards uniform on its own: at
+              `a = 0` and `b > 0` the result is not FedAvg but a pull of every
+              client towards an equal say. FedAvg is recovered at `a = b = 0`.
+        ReLU: `max(x, 0)`. This is what lets an extreme client be dropped
+              entirely rather than given a negative say.
+
+    Because the weights sum to 1, the server's weighted sum `sum_k w_k * W_k` is
+    already the averaged model - which is why FedDisco is in
+    `SERVER_RETURNS_FINAL_MODEL` and its clients divide by 1.0 rather than by N.
+
+    Args:
+        sizes: `n_k` for each client of the round, in the same order as
+            `discrepancies`.
+        discrepancies: `d_k` for the same clients, same order.
+        a: the discrepancy coefficient, config key `feddisco_a`.
+        b: the offset, config key `feddisco_b`.
+
+    Returns:
+        `w_k` as a float array summing to 1, one entry per client.
+
+    Raises:
+        ValueError: if the two sequences have different lengths, or are empty.
+
+    Two degenerate cases, both handled by falling back rather than raising,
+    because either one raising would kill a run in the middle of training:
+
+      - every score at zero (`a` large enough that every client is punished
+        below the floor). Normalising would divide by zero and blanking the
+        weights would blank the model, so the round falls back to the
+        size-proportional weights, i.e. to FedAvg;
+      - `N = 0`, nobody reported any data. The weights are then uniform, and the
+        caller is expected to have refused the round already - the size-weighted
+        path does exactly that (`aggregator.py:61`).
+    """
+    n = np.asarray(sizes, dtype=float).ravel()
+    d = np.asarray(discrepancies, dtype=float).ravel()
+    if n.size != d.size:
+        raise ValueError(
+            f"feddisco_weights got {n.size} sizes and {d.size} discrepancies; "
+            f"they must describe the same clients, in the same order."
+        )
+    if n.size == 0:
+        raise ValueError("feddisco_weights got no clients.")
+
+    total = n.sum()
+    if total <= 0:
+        return np.full(n.size, 1.0 / n.size)
+
+    shares = n / total
+    scores = np.maximum(shares - a * d + b, 0.0)
+
+    if scores.sum() <= 0:
+        # Nobody survived the discount. Falling back to FedAvg's weights keeps
+        # the round meaningful; it is also the only choice that leaves the model
+        # on the scale the client expects.
+        return shares
+    return scores / scores.sum()
