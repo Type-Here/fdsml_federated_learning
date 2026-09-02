@@ -18,6 +18,7 @@ from config_fingerprint import (
     EXTRA_FINGERPRINT_KEYS,
     get_config_fingerprint,
     normalize_augmentation_keys,
+    normalize_feddisco_keys,
     normalize_fipa_keys,
     normalize_partition_keys,
 )
@@ -239,6 +240,7 @@ def main(config_path: str = GRID_SEARCH_CONFIG_PATH):
                 if row.get('aggregation_algorithm') != "FedProx": row['fedprox_mu'] = '0.0'
                 normalize_partition_keys(row)
                 normalize_fipa_keys(row)
+                normalize_feddisco_keys(row)
                 normalize_augmentation_keys(row)
                 if 'ResNet' in model_name_from_row or 'GoogLeNet' in model_name_from_row or 'AlexNet' in model_name_from_row:
                     row.setdefault('image_size', '224')
@@ -274,6 +276,7 @@ def main(config_path: str = GRID_SEARCH_CONFIG_PATH):
                 if hyper_config.get('aggregation_algorithm') != "FedProx": hyper_config['fedprox_mu'] = 0.0
                 normalize_partition_keys(hyper_config)
                 normalize_fipa_keys(hyper_config)
+                normalize_feddisco_keys(hyper_config)
                 normalize_augmentation_keys(hyper_config)
                 if 'ResNet' in model_name or 'GoogLeNet' in model_name or 'AlexNet' in model_name:
                     # setdefault, NOT assignment: this block only normalizes keys so
