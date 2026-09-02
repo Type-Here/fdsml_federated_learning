@@ -13,14 +13,15 @@ Everything the base class already does correctly is inherited untouched:
 Contents:
   - `begin_round`                 : the aggregation keys the server puts in the
     round payload, plus the snapshot of the parameters it is broadcasting.
-  - `aggregate_weights`           : dispatch on the algorithm, including FIPA.
+  - `aggregate_weights`           : dispatch on the algorithm, including
+    FedDisco and FIPA.
   - `aggregate_encrypted_updates` : makes the encrypted path honor the
     configured aggregation algorithm instead of always weighting by size, and
-    routes FIPA to its Paillier branch.
+    routes FedDisco and FIPA to their Paillier branches.
   - `aggregate_train_loss`        : a method the server calls but the base class
     never defines.
   - `register_client_stats`       : receives the per-client label distributions,
-    keyed by client id, that a discrepancy-aware rule needs.
+    keyed by client id, that FedDisco weighs its clients with.
   - `client_denominator`          : what the client must divide the round
     payload by, forwarded from `aggregation_policy`.
   - `save_results`                : the base behavior plus the trained model
@@ -32,8 +33,6 @@ therefore testable on a machine without a GPU stack; the linear algebra of FIPA
 lives in `fipa.py` and its Paillier arithmetic in `fipa_encrypted.py`, torch-free
 for the same reason. This file is the part that has to touch tensors, and it is
 deliberately thin.
-
-Deliberately not here yet: the FedDisco branches.
 """
 
 import json
@@ -47,7 +46,9 @@ import numpy as np
 
 import fipa
 import fipa_encrypted
-from aggregation_policy import NEEDS_GLOBAL_WEIGHTS, SUM_WEIGHTED_BY_SIZE
+from aggregation_policy import (FEDDISCO_DEFAULT_A, FEDDISCO_DEFAULT_B,
+                                NEEDS_GLOBAL_WEIGHTS, SUM_WEIGHTED_BY_SIZE,
+                                feddisco_weights, label_distribution_discrepancy)
 from aggregation_policy import client_denominator as denominator_for_algorithm
 from aggregation_policy import effective_algorithm as effective_algorithm_for_round
 from aggregator import Aggregator
@@ -318,8 +319,8 @@ class ExtendedAggregator(Aggregator):
 
         The base class handles the size-weighted family and raises for anything
         else (`aggregator.py:74`). This override keeps that behavior, adds the
-        FIPA branch, and records which rule ran so that `client_denominator` can
-        describe the result.
+        FedDisco and FIPA branches, and records which rule ran so that
+        `client_denominator` can describe the result.
 
         It also checks `payload_kind` before doing anything. The two families
         put different things in `weights` - absolute parameters for FedAvg,
@@ -340,6 +341,9 @@ class ExtendedAggregator(Aggregator):
         if algorithm in SUM_WEIGHTED_BY_SIZE:
             self._require_payload_kind(client_updates, 'weights', algorithm)
             aggregated = super().aggregate_weights(client_updates, algorithm)
+        elif algorithm == 'FedDisco':
+            self._require_payload_kind(client_updates, 'weights', algorithm)
+            aggregated = self._aggregate_feddisco(client_updates)
         elif algorithm == 'FIPA':
             self._require_payload_kind(client_updates, 'delta', algorithm)
             aggregated = self._aggregate_fipa(client_updates)
@@ -368,6 +372,168 @@ class ExtendedAggregator(Aggregator):
                     f"'{kind}'. The server and the client disagree on which "
                     f"rule governs this round."
                 )
+
+    # ------------------------------------------------------------------
+    # FedDisco: size, discounted by how skewed the client's labels are
+    # ------------------------------------------------------------------
+    def _feddisco_weights(self, client_updates: List[Dict]) -> np.ndarray:
+        """The `w_k` of this round, one per update, in the updates' own order.
+
+        The one place that pairs an update with its sender's label
+        distribution. That pairing is the whole difficulty of FedDisco on this
+        codebase and the reason `client_id` exists: readiness fills
+        `client_stats` in connection order, updates arrive in
+        whoever-finished-training-first order, and only a subset of the clients
+        is sampled each round, so the two cannot be matched by list position.
+
+        The arithmetic itself is in `aggregation_policy.feddisco_weights`, which
+        imports neither torch nor this module and is therefore the part that can
+        be exercised on a machine without a GPU stack.
+
+        A client whose statistics are missing is treated as perfectly balanced
+        (`d_k = 0`), i.e. weighed exactly as FedAvg would weigh it, with a
+        warning. That cannot happen in a normal run - the server only starts a
+        round once every client has reported ready - and refusing the round
+        instead would throw away the other clients' training over one
+        bookkeeping gap.
+        """
+        sizes = []
+        discrepancies = []
+        for update in client_updates:
+            client_id = update.get('client_id', '?')
+            stats = self.client_stats.get(client_id)
+            if stats is None:
+                self.logger.warning(
+                    "FedDisco has no label distribution for client '%s'; "
+                    "weighing it as if its data were perfectly balanced.",
+                    client_id,
+                )
+                discrepancies.append(0.0)
+            else:
+                discrepancies.append(label_distribution_discrepancy(stats))
+            sizes.append(float(update.get('train_size', 0)))
+
+        weights = feddisco_weights(
+            sizes, discrepancies,
+            a=float(self.config.get('feddisco_a', FEDDISCO_DEFAULT_A)),
+            b=float(self.config.get('feddisco_b', FEDDISCO_DEFAULT_B)),
+        )
+
+        self._record_feddisco_diagnostics(client_updates, sizes, discrepancies, weights)
+        return weights
+
+    def _record_feddisco_diagnostics(self, client_updates: List[Dict],
+                                     sizes: List[float], discrepancies: List[float],
+                                     weights: np.ndarray) -> None:
+        """Log the round's weights, and put the departure from FedAvg in the CSV.
+
+        Without this, "the run says FedDisco" is all anyone can check afterwards.
+        The number recorded is `max_k |w_k - n_k/N|`, i.e. how far the round
+        moved from the FedAvg weights it would otherwise have used: 0 means
+        FedDisco behaved exactly like FedAvg on this round, and a large value
+        means the discount actually bit. `feddisco_clients_dropped` counts the
+        clients the ReLU pushed to zero - a client whose local training was
+        discarded entirely, which is worth seeing rather than inferring.
+        """
+        total = sum(sizes)
+        shares = (np.asarray(sizes) / total if total > 0
+                  else np.full(len(sizes), 1.0 / max(len(sizes), 1)))
+        departure = float(np.max(np.abs(weights - shares))) if len(sizes) else 0.0
+        dropped = int(np.sum(weights == 0.0))
+
+        self.metrics_history.setdefault(self.round_number, {}).update({
+            'feddisco_weight_shift': departure,
+            'feddisco_clients_dropped': dropped,
+        })
+        self.logger.info(
+            "FedDisco weights (a=%.3f, b=%.3f): %s. Largest departure from the "
+            "FedAvg weights %.4f, clients dropped %d.",
+            float(self.config.get('feddisco_a', FEDDISCO_DEFAULT_A)),
+            float(self.config.get('feddisco_b', FEDDISCO_DEFAULT_B)),
+            ", ".join(
+                "%s n=%d d=%.4f w=%.4f (FedAvg %.4f)"
+                % (u.get('client_id', '?'), n, d, w, p)
+                for u, n, d, w, p in zip(client_updates, sizes, discrepancies,
+                                         weights, shares)
+            ),
+            departure, dropped,
+        )
+
+    def _aggregate_feddisco(self, client_updates: List[Dict]) -> bool:
+        """`W <- sum_k w_k * W_k`, with `w_k` summing to 1.
+
+        The same loop the base class runs for FedAvg (`aggregator.py:64-68`),
+        with the normalised FedDisco weight in place of the raw `train_size`.
+        One consequence, and it is the one to keep in mind: because the weights
+        sum to 1 this is the **average** and not a sum, so the clients must
+        divide by 1.0. They are told so - FedDisco is in
+        `aggregation_policy.SERVER_RETURNS_FINAL_MODEL`, and `client_denominator`
+        answers 1.0 for it once this round has been recorded.
+
+        Returns:
+            True if the aggregation ran; False for a round in which no client
+            reported any data, matching what the size-weighted path does.
+        """
+        if sum(u.get('train_size', 0) for u in client_updates) == 0:
+            self.logger.warning("Total training size is 0. Skipping aggregation.")
+            return False
+
+        w = self._feddisco_weights(client_updates)
+
+        aggregated = [layer * w[0] for layer in client_updates[0]['weights']]
+        for k in range(1, len(client_updates)):
+            client_weights = client_updates[k]['weights']
+            for i in range(len(aggregated)):
+                aggregated[i] += client_weights[i] * w[k]
+
+        self.current_weights = aggregated
+        self.logger.info("FedDisco aggregation complete over %d clients.",
+                         len(client_updates))
+        return True
+
+    def _aggregate_feddisco_encrypted(self, client_updates: List[Dict]) -> bool:
+        """The same rule under Paillier: scale each ciphertext by `w_k`, then add.
+
+        FedDisco is linear in the client weights, so it crosses the encryption
+        barrier untouched - the server needs exactly the two operations Paillier
+        offers, multiplying a ciphertext by a plaintext scalar and adding
+        ciphertexts. The `w_k` themselves are computed in the clear from `n_k`
+        and `d_k`, neither of which is a model parameter.
+
+        **The one thing to be careful about, and it is not the algebra.**
+        Paillier is fixed point with a ceiling: `phe` stores a float as
+        `int_rep * 16^exponent` and encrypts only the integer, which has to stay
+        under `n/3`; a multiplication *adds* exponents. Where FedAvg multiplied
+        by an integer `n_k` in the thousands, FedDisco multiplies by a float
+        `w_k` around 0.25, which consumes about fourteen orders of magnitude of
+        that budget in one go. That is affordable **once**, which is exactly what
+        happens here: one multiplication per ciphertext, then only additions, and
+        the client decrypts and re-encrypts every round so nothing accumulates
+        across rounds. Do not add a second float factor to this path without
+        reading `fipa_encrypted.py`'s module docstring first.
+
+        Returns:
+            True if the aggregation ran; False for a round in which no client
+            reported any data.
+        """
+        if sum(u.get('train_size', 0) for u in client_updates) == 0:
+            self.logger.warning(
+                "Total training size is 0. Skipping encrypted aggregation.")
+            return False
+
+        w = self._feddisco_weights(client_updates)
+
+        summed = multiply_encrypted_weights_by_scalar(
+            client_updates[0]['weights'], float(w[0]))
+        for k in range(1, len(client_updates)):
+            weighted_update = multiply_encrypted_weights_by_scalar(
+                client_updates[k]['weights'], float(w[k]))
+            summed = sum_encrypted_weights(summed, weighted_update)
+
+        self.current_weights = summed
+        self.logger.info("Encrypted FedDisco aggregation complete over %d clients.",
+                         len(client_updates))
+        return True
 
     def _aggregate_fipa(self, client_updates: List[Dict]) -> bool:
         """`theta <- theta + sum_m B_m Delta_m`.
@@ -553,8 +719,8 @@ class ExtendedAggregator(Aggregator):
         `aggregation_algorithm` said. For FedAvg/FedProx/FedLC that happens to be
         the right rule, so no existing result is affected - but an unknown
         algorithm was silently treated as FedAvg, where the plaintext path raises.
-        This override makes the encrypted path mirror the plaintext one, and
-        gives a discrepancy-aware rule somewhere to hook in.
+        This override makes the encrypted path mirror the plaintext one, which
+        is what lets FedDisco run encrypted at all.
 
         The `algorithm` argument is optional so the existing call in
         `federated_server._aggregate_updates` keeps working unchanged.
@@ -578,6 +744,11 @@ class ExtendedAggregator(Aggregator):
         if algorithm in SUM_WEIGHTED_BY_SIZE:
             self._require_payload_kind(round_client_updates, 'weights', algorithm)
             aggregated = self._encrypted_sum_weighted_by_size(round_client_updates)
+        elif algorithm == 'FedDisco':
+            # Same payload as FedAvg - absolute, encrypted parameters. Only the
+            # scalar each one is multiplied by changes.
+            self._require_payload_kind(round_client_updates, 'weights', algorithm)
+            aggregated = self._aggregate_feddisco_encrypted(round_client_updates)
         elif algorithm == 'FIPA':
             # 'fipa_z' and not 'delta': under encryption the client keeps the
             # delta and sends its projection onto its own curvature directions,
@@ -586,10 +757,10 @@ class ExtendedAggregator(Aggregator):
             self._require_payload_kind(round_client_updates, 'fipa_z', algorithm)
             aggregated = self._aggregate_fipa_encrypted(round_client_updates)
         else:
-            # FedDisco and any future rule land here. Raising rather than
-            # silently falling back to FedAvg is the whole point of this fix: a
-            # configuration naming an algorithm we have not implemented for the
-            # encrypted path must fail loudly, not produce a mislabeled run.
+            # Any future rule lands here. Raising rather than silently falling
+            # back to FedAvg is the whole point of this fix: a configuration
+            # naming an algorithm we have not implemented for the encrypted path
+            # must fail loudly, not produce a mislabeled run.
             raise ValueError(
                 f"Aggregation algorithm '{algorithm}' is not supported on the encrypted path."
             )
