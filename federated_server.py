@@ -73,6 +73,27 @@ class FederatedServer:
 
         self.static_calibration_term: np.ndarray = None
 
+        # --- Round watchdog -----------------------------------------
+        # A round advances only when every sampled client answers, and no step
+        # of the protocol has a deadline. So one client that dies mid-run - an
+        # out-of-memory error in its training thread, a process killed by hand -
+        # leaves the server waiting on a barrier that can never be satisfied
+        # again. The cost is not one run: the launcher that started this server
+        # is blocked joining the client threads behind it, so every
+        # configuration still queued behind this one waits too.
+        #
+        # `round_timeout_seconds` bounds the time between two signs of life:
+        # a readiness message, an update, an evaluation, or the start of a
+        # round. Any of them resets the clock. It is deliberately generous -
+        # a whole round passes with no traffic at all while the clients train,
+        # and that stretch grows with local_epoch and with how many runs share
+        # the GPU - so this is a way out of a hang, not a scheduling policy.
+        # Set it to 0 to disable the watchdog entirely.
+        self.round_timeout: float = float(self.config.get('round_timeout_seconds', 1800))
+        self.last_progress_time: float = time.monotonic()
+        self.round_stage: str = 'client readiness'
+        self.aborted: bool = False
+
         # --- Encryption ---
         self.encryption_mode: str = self.config.get('encryption_mode', 'none')
         if self.encryption_mode != 'no_encryption':
@@ -116,7 +137,93 @@ class FederatedServer:
     def run(self) -> None:
         """Starts the Flask-SocketIO server."""
         self.logger.info("Federated Server starting...")
+        if self.round_timeout > 0:
+            self.logger.info(
+                "Round watchdog armed: %.0f s without a sign of life ends the run.",
+                self.round_timeout,
+            )
+            # A green thread on the same hub as the handlers, so it observes the
+            # server's state directly and needs no locking of its own beyond the
+            # one lock the handlers already use. It is only scheduled once the
+            # hub is running, which is what the next line starts.
+            self.socketio.start_background_task(self._round_watchdog)
+        else:
+            self.logger.info("Round watchdog disabled by configuration.")
         self.socketio.run(self.app, host=self.config['ip_address'], port=self.config['port'])
+
+    # --- Progress tracking and the watchdog ---
+
+    def _note_progress(self, stage: str = None) -> None:
+        """Record that the run just moved forward.
+
+        `stage` names what the server is about to wait for, and is only there so
+        that a timeout can say which barrier it died on rather than just that it
+        died.
+        """
+        self.last_progress_time = time.monotonic()
+        if stage is not None:
+            self.round_stage = stage
+
+    def _round_watchdog(self) -> None:
+        """End the run when nothing has happened for `round_timeout` seconds.
+
+        Polls rather than arming a timer per round: the thing being measured is
+        silence, and silence has no event to hang a callback on. The poll is
+        cooperative (`socketio.sleep`), so it never blocks the single OS thread
+        the event loop runs on - a long aggregation simply delays the check,
+        which is harmless because the check is about minutes, not seconds.
+        """
+        interval = min(30.0, max(1.0, self.round_timeout / 10.0))
+        while not self.is_training_finished and not self.aborted:
+            self.socketio.sleep(interval)
+            if self.is_training_finished or self.aborted:
+                return
+            idle = time.monotonic() - self.last_progress_time
+            if idle >= self.round_timeout:
+                self._abort_run(idle)
+                return
+
+    def _abort_run(self, idle_seconds: float) -> None:
+        """Stop a run that can no longer finish, and free the launcher.
+
+        The shutdown is done after the lock is released, for the same reason
+        `_on_client_eval` does it: the shutdown path yields to the event loop,
+        and yielding while holding an ordinary lock on an unpatched eventlet
+        server replaces a hang with a deadlock.
+        """
+        with self.lock:
+            if self.is_training_finished or self.aborted:
+                return
+            self.aborted = True
+            self.is_training_finished = True
+
+            message = (
+                f"Round watchdog: no progress for {idle_seconds:.0f} s while waiting for "
+                f"{self.round_stage} at round {self.current_round} "
+                f"({len(self.client_updates_this_round)}/{self.num_clients_per_round} updates, "
+                f"{len(self.client_evaluations_this_round)}/{len(self.registered_clients)} evaluations, "
+                f"{len(self.client_stats)}/{self.config['num_clients']} clients ever ready). "
+                f"Ending this run so the next one can start."
+            )
+            self.logger.error(message)
+            # Also on stdout: the launcher's own output is printed, and this is
+            # the line someone reading the terminal afterwards needs to find.
+            print("\n" + "!" * 80 + f"\n{message}\n" + "!" * 80, flush=True)
+
+            self.aggregator.log_best_model_stats()
+            self.aggregator.save_results()
+            # Keep the artifacts, refuse the result. `save_results` has just
+            # written the per-round metrics and the checkpoint, so nothing that
+            # was actually measured is lost and a truncated run can still be
+            # inspected. Dropping the summary keeps it out of the shared results
+            # file, where a run that stopped at round 7 would be indistinguishable
+            # from one that finished - and the launcher only records a row when a
+            # summary is there, so this configuration stays unrecorded and is
+            # attempted again the next time the grid is started. Set this to keep
+            # the summary if a partial row is ever preferred to a retry.
+            self.aggregator.run_summary = None
+
+        self._shutdown_server(broadcast=True)
 
     def _register_routes_and_handlers(self) -> None:
         """Registers Flask routes and SocketIO event handlers."""
@@ -156,6 +263,19 @@ class FederatedServer:
 
         all_available_clients = list(self.registered_clients)
         print("NUM CLIENT SPLIT:",all_available_clients, self.min_num_workers)
+        if len(all_available_clients) < self.min_num_workers:
+            # random.sample raises here, and it would raise *inside a SocketIO
+            # handler*, where the traceback goes nowhere and the round is simply
+            # never requested - a hang with no stated cause. Say the cause, and
+            # leave the run to the watchdog, which is already the one thing that
+            # can end it. Returning without emitting is not a recovery: a client
+            # that is gone cannot be replaced mid-run.
+            self.logger.error(
+                "Only %d of the %d required clients are connected. No round can be "
+                "requested; waiting for the round watchdog to end the run.",
+                len(all_available_clients), self.min_num_workers,
+            )
+            return
         selected_clients = random.sample(all_available_clients, self.min_num_workers)
 
         self.num_clients_per_round = len(selected_clients)
@@ -180,6 +300,7 @@ class FederatedServer:
         }
 
         self.logger.info("Requesting updates from clients: %s", selected_clients)
+        self._note_progress('client updates')
         for sid in selected_clients:
             emit('request_update', request_data, room=sid)
 
@@ -187,6 +308,7 @@ class FederatedServer:
         """Sends the aggregated model to all clients for evaluation."""
         self.logger.info("Triggering global model evaluation on all %d clients.", len(self.registered_clients))
         self.client_evaluations_this_round.clear()
+        self._note_progress('client evaluations')
 
         data_to_send = {
             'batch_size': self.config['batch_size'],
@@ -233,11 +355,23 @@ class FederatedServer:
         else:
             self.aggregator.aggregate_train_loss(train_losses, self.current_round)
 
-    def _shutdown_server(self):
-        """Shuts down the Werkzeug server. Note: For development use only."""
+    def _shutdown_server(self, broadcast: bool = False):
+        """Shuts down the Werkzeug server. Note: For development use only.
+
+        `broadcast` exists for the watchdog. The default path runs inside a
+        SocketIO handler, where flask_socketio's `emit` is bound to the request
+        that is being served; the watchdog runs in a background task, where the
+        same call raises for want of a request context. `socketio.emit`
+        addresses every connected client instead, which is what an aborted run
+        wants anyway - a normal shutdown has already told each client
+        individually one line earlier.
+        """
         # self.logger.info("Shutting down the server.")
         ta_address = f"http://{self.config['ip_address']}:{self.config['ta_port']}"
-        emit('shutdown', {'ta_address': ta_address})
+        if broadcast:
+            self.socketio.emit('shutdown', {'ta_address': ta_address})
+        else:
+            emit('shutdown', {'ta_address': ta_address})
         # socketio.sleep, not time.sleep. The server runs on eventlet without
         # monkey patching, so every connection is a green thread on one OS
         # thread: the real time.sleep blocks the whole hub, the queued
@@ -298,6 +432,7 @@ class FederatedServer:
     def _on_client_ready(self, data: Dict):
         client_id = self._client_key(data)
         self.logger.info("Client %s (sid %s) is ready and sent data stats.", client_id, request.sid)
+        self._note_progress()
 
         # A reconnecting client comes back under a new sid. Drop the stale one,
         # otherwise `_start_next_training_round` can sample a dead sid and the
@@ -374,6 +509,7 @@ class FederatedServer:
             data['sid'] = request.sid
 
             self.client_updates_this_round.append(data)
+            self._note_progress()
 
             if len(self.client_updates_this_round) >= self.num_clients_per_round:
                 self.logger.info("All %d client updates for round %d received. Aggregating...",
@@ -397,6 +533,7 @@ class FederatedServer:
         with self.lock:
             self.logger.info("Received evaluation from client %s.", request.sid)
             self.client_evaluations_this_round.append(data)
+            self._note_progress()
 
             if len(self.client_evaluations_this_round) >= len(self.registered_clients):
                 self.logger.info("All evaluations received for round %d. Aggregating evaluation metrics.",

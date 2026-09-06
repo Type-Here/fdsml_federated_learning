@@ -404,13 +404,39 @@ class PartitionedDatasetSplitter(DatasetSplitter):
         """Hold out a validation share of one client's units.
 
         Stratified by class when possible, so validation covers the classes the
-        client actually holds. Stratification needs at least 2 units per class,
-        which under a strong skew is often false - hence the same guard the
-        received code uses, and the same last-resort fallback.
+        client actually holds. Stratification has **two** requirements, and
+        missing the second one is what made this function dangerous:
+
+        1. at least 2 units per class, so each class can appear on both sides;
+        2. at least as many validation units as there are classes, because a
+           stratified split must place one unit of every class in the
+           validation share and cannot do so with fewer slots than classes.
+
+        The second is the perverse one. A client holding all 43 classes over 249
+        tracks asks for `0.1 * 249 = 25` validation tracks, which is fewer than
+        43, so `train_test_split` raises - while a *more* skewed client holding
+        14 classes never even attempts to stratify and is fine. The better a
+        client's class coverage, the more likely the failure.
+
+        What that cost before this guard existed: the sole fallback was
+        `units[:-1], units[-1:]`, a validation set of **one** track - 30 frames
+        of one physical sign, one class. The client then reports an accuracy on
+        a one-class problem, the server folds it into the round's weighted mean
+        (`aggregator.py:99`), and the run's metrics are quietly part nonsense.
+        Nothing raises, and the CSV looks ordinary.
+
+        So the retry is unstratified rather than degenerate: a random 10% still
+        covers most classes at these sizes, and it keeps the validation set the
+        size it was asked to be. The one-unit split survives only as the last
+        resort it was meant to be, for a client too small to divide at all.
         """
         labels = unit_labels[units]
         class_counts = pd.Series(labels).value_counts()
-        can_stratify = len(units) >= 10 and class_counts.min() >= 2
+        # Mirrors what train_test_split does with a fractional test_size.
+        n_valid_units = int(np.ceil(len(units) * validation_split_size))
+        can_stratify = (len(units) >= 10
+                        and class_counts.min() >= 2
+                        and n_valid_units >= len(class_counts))
 
         try:
             train_units, valid_units = train_test_split(
@@ -420,8 +446,17 @@ class PartitionedDatasetSplitter(DatasetSplitter):
                 stratify=labels if can_stratify else None,
             )
         except ValueError as error:
-            print(f"  Warning: train/valid split fallback ({error}).")
-            train_units, valid_units = units[:-1], units[-1:]
+            print(f"  Warning: stratified train/valid split failed ({error}); "
+                  f"retrying without stratification.")
+            try:
+                train_units, valid_units = train_test_split(
+                    units,
+                    test_size=validation_split_size,
+                    random_state=self.seed,
+                )
+            except ValueError as second_error:
+                print(f"  Warning: train/valid split fallback ({second_error}).")
+                train_units, valid_units = units[:-1], units[-1:]
 
         return train_units, valid_units
 

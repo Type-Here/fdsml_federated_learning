@@ -14,6 +14,7 @@ independent of torch and of the real GTSRB download.
 
 from collections import defaultdict
 
+import numpy as np
 import pytest
 
 from data_splitter_ext import (
@@ -295,3 +296,60 @@ def test_alpha_too_small_for_the_client_count_fails_loudly(source_dir, tmp_path)
 def test_invalid_options_are_rejected(source_dir, tmp_path, bad_kwargs):
     with pytest.raises(ValueError):
         make_splitter(source_dir, tmp_path / "out", **bad_kwargs)
+
+# ---------------------------------------------------------------------------
+# The train/valid split of one client's share
+# ---------------------------------------------------------------------------
+
+def _client_holding_every_class(units_per_class):
+    """One client's units, `units_per_class` of each of the NUM_CLASSES classes."""
+    units = np.arange(NUM_CLASSES * units_per_class)
+    labels = np.repeat(np.arange(NUM_CLASSES), units_per_class)
+    return units, labels
+
+
+def test_a_wide_client_keeps_a_full_size_validation_split(source_dir, tmp_path):
+    """The validation share must stay the size that was asked for.
+
+    A client holding every class over few units cannot be split in a stratified
+    way - a stratified validation share needs one unit per class and there are
+    fewer slots than classes. The retry is unstratified, NOT a single unit: the
+    perverse part is that this hits the clients with the *best* class coverage,
+    and the metric they report is folded into the round's weighted mean.
+    """
+    splitter = make_splitter(source_dir, tmp_path / "out")
+    units, labels = _client_holding_every_class(units_per_class=5)   # 30 units
+    # ceil(30 * 0.1) = 3 validation units against 6 classes: stratification is
+    # impossible, and 3 is what a correct split still returns.
+    train_units, valid_units = splitter._split_units_train_valid(units, labels, 0.1)
+
+    assert len(valid_units) == 3
+    assert len(train_units) == len(units) - 3
+    assert set(train_units).isdisjoint(valid_units)
+    assert set(train_units) | set(valid_units) == set(units)
+
+
+def test_a_narrow_client_is_still_stratified(source_dir, tmp_path):
+    """When stratification IS possible it must still be used.
+
+    With enough units the validation share has a slot per class, so every class
+    the client holds appears in its validation set - which is the reason the
+    stratified path exists at all.
+    """
+    splitter = make_splitter(source_dir, tmp_path / "out")
+    units, labels = _client_holding_every_class(units_per_class=15)  # 90 units
+    train_units, valid_units = splitter._split_units_train_valid(units, labels, 0.1)
+
+    assert len(valid_units) == 9
+    assert set(labels[valid_units]) == set(range(NUM_CLASSES))
+
+
+def test_a_client_too_small_to_divide_falls_back_to_one_unit(source_dir, tmp_path):
+    """The last resort survives, for the case it was written for."""
+    splitter = make_splitter(source_dir, tmp_path / "out")
+    units = np.arange(1)
+    labels = np.zeros(1, dtype=int)
+    train_units, valid_units = splitter._split_units_train_valid(units, labels, 0.1)
+
+    assert len(valid_units) == 1
+    assert len(train_units) == 0
