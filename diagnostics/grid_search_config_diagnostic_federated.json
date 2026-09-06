@@ -1,12 +1,13 @@
 {
+  "_comment": "LADDER RUN, to be launched only after the gate config has shown the head can learn at all. Two axes crossed, four runs. num_custom_layers separates 'FedAvg averages a hidden layer whose units nobody aligned' from everything else: with one Linear there is no hidden layer and no permutation freedom. dirichlet_alpha separates 'the label skew is what breaks it' - which is what unsynchronised BatchNorm statistics predict, since they only drift apart when the clients see different classes - from a failure that happens even on near-IID data. alpha 100 is the near-uniform control, alpha 0.5 reproduces the failing cell. Same separate base paths as the gate config.",
   "ip_address": "127.0.0.1",
-  "port": 5001,
-  "base_csv_path": "csv",
-  "base_log_path": "logs",
-  "base_plot_path": "static/plots",
-  "base_split_data_path": "run_dataset",
-  "base_checkpoint_path": "checkpoints",
-  "early_stop_patience": 5,
+  "port": 5401,
+  "base_csv_path": "csv_diagnostic",
+  "base_log_path": "logs_diagnostic",
+  "base_plot_path": "static/plots_diagnostic",
+  "base_split_data_path": "run_dataset_diagnostic",
+  "base_checkpoint_path": "checkpoints_diagnostic",
+  "early_stop_patience": 999,
   "weighted_aggregation": true,
   "num_parallel_executions": 1,
   "seed": 42,
@@ -25,15 +26,13 @@
       "cuda"
     ],
     "global_epoch": [
-      30
+      10
     ],
     "local_epoch": [
-      1,
-      5
+      1
     ],
     "num_clients": [
-      4,
-      8
+      4
     ],
     "models_percentage": [
       1
@@ -45,9 +44,7 @@
       16
     ],
     "aggregation_algorithm": [
-      "FedAvg",
-      "FedProx",
-      "FIPA"
+      "FedAvg"
     ],
     "fedprox_mu": [
       0.05
@@ -56,9 +53,8 @@
       "dirichlet"
     ],
     "dirichlet_alpha": [
-      0.1,
-      0.5,
-      1.0
+      100.0,
+      0.5
     ],
     "partition_unit": [
       "track"
@@ -74,9 +70,6 @@
     ],
     "fipa_pinv_rtol": [
       1e-8
-    ],
-    "train_augmentation": [
-      false
     ]
   },
   "model_specific_search_space": {
@@ -85,24 +78,8 @@
         128
       ],
       "num_custom_layers": [
+        1,
         2
-      ]
-    },
-    "ConvNet": {
-      "image_size": [
-        128
-      ],
-      "convnet_hidden1": [
-        32
-      ],
-      "convnet_hidden2": [
-        16
-      ],
-      "local_epoch": [
-        1
-      ],
-      "num_clients": [
-        4
       ]
     }
   }

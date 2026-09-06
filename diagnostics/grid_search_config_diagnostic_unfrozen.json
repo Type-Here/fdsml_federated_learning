@@ -1,12 +1,13 @@
 {
+  "_comment": "REFERENCE ONLY - not a checkpoint candidate. num_custom_layers 0 trains the whole ResNet18, all 11.2M parameters, which is what the federated scheme deliberately does NOT do. It answers one question and it is worth a sentence in the write-up: how many points the frozen backbone costs. It cannot be used for the checkpoint - a Fisher information estimate over 11M parameters is not tractable, so FIPA could not run on it, and the trainable set would then include the BatchNorm affine parameters, which is exactly the separation between the two halves of the project. Expect it to be slow: full backpropagation, and every round ships 11.2M floats over the socket instead of 142k.",
   "ip_address": "127.0.0.1",
-  "port": 5001,
-  "base_csv_path": "csv",
-  "base_log_path": "logs",
-  "base_plot_path": "static/plots",
-  "base_split_data_path": "run_dataset",
-  "base_checkpoint_path": "checkpoints",
-  "early_stop_patience": 5,
+  "port": 5401,
+  "base_csv_path": "csv_diagnostic",
+  "base_log_path": "logs_diagnostic",
+  "base_plot_path": "static/plots_diagnostic",
+  "base_split_data_path": "run_dataset_diagnostic",
+  "base_checkpoint_path": "checkpoints_diagnostic",
+  "early_stop_patience": 999,
   "weighted_aggregation": true,
   "num_parallel_executions": 1,
   "seed": 42,
@@ -25,15 +26,13 @@
       "cuda"
     ],
     "global_epoch": [
-      30
-    ],
-    "local_epoch": [
-      1,
       5
     ],
+    "local_epoch": [
+      1
+    ],
     "num_clients": [
-      4,
-      8
+      1
     ],
     "models_percentage": [
       1
@@ -45,9 +44,7 @@
       16
     ],
     "aggregation_algorithm": [
-      "FedAvg",
-      "FedProx",
-      "FIPA"
+      "FedAvg"
     ],
     "fedprox_mu": [
       0.05
@@ -56,9 +53,7 @@
       "dirichlet"
     ],
     "dirichlet_alpha": [
-      0.1,
-      0.5,
-      1.0
+      100.0
     ],
     "partition_unit": [
       "track"
@@ -73,10 +68,7 @@
       64
     ],
     "fipa_pinv_rtol": [
-      1e-8
-    ],
-    "train_augmentation": [
-      false
+      1e-08
     ]
   },
   "model_specific_search_space": {
@@ -85,24 +77,7 @@
         128
       ],
       "num_custom_layers": [
-        2
-      ]
-    },
-    "ConvNet": {
-      "image_size": [
-        128
-      ],
-      "convnet_hidden1": [
-        32
-      ],
-      "convnet_hidden2": [
-        16
-      ],
-      "local_epoch": [
-        1
-      ],
-      "num_clients": [
-        4
+        0
       ]
     }
   }
