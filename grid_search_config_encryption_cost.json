@@ -1,0 +1,96 @@
+{
+  "_comment": "Six runs measuring what Paillier encryption COSTS, at the head size the main grid actually trains. The main grid is plaintext-only on purpose: the encrypted path is not a different algorithm, it is the same arithmetic carried out over ciphertexts, and phe reproduces the plaintext result to about 1e-15 relative - measured twice on hardware, where two runs of the same plaintext configuration with the same seed differed more from each other (44 validation images of 330 at round 1, because the classifier head is initialised from the global Torch RNG inside concurrent client threads) than the encrypted run differed from either. So an encrypted twin of every grid cell would have measured the clock and the head initialisation noise, at roughly 111 extra GPU hours. What it WOULD have measured, and what this file measures instead, is the overhead - which depends on the payload size and the aggregation rule, not on the label skew or the round index. Hence: no dirichlet_alpha axis, no num_clients axis, 5 rounds instead of 30. Three algorithms x two encryption modes. FedProx is left out because its server-side arithmetic is identical to FedAvg's, so its encrypted cost is FedAvg's by construction. FedDisco is the run that matters most and the only one never yet executed under encryption on real hardware: where FedAvg multiplies each ciphertext by an integer sample count in the thousands, FedDisco multiplies by a normalised float around 0.25, which consumes about fourteen orders of magnitude of Paillier's headroom in a single operation - and past that ceiling nothing raises, the integer wraps and decrypts to a plausible wrong number. Its plaintext/encrypted equality has been checked on a real keypair only at toy parameter counts. FIPA is included because its encrypted cost is the interesting one: the client sends the projection of its delta onto r directions rather than the whole delta, so the homomorphic work moves from the clients to the server, and the previous measurement of that was taken on a head roughly a sixth of this one. Read the results off the total_duration column, pairing each encrypted row with the plaintext row that shares its aggregation_algorithm, and check that best_f1 agrees between the two members of each pair to within the run-to-run spread - a real gap there is a fixed-point overflow, not an encryption tax. Requires gmpy2 installed: phe uses it for modular exponentiation when present and silently falls back to pure Python otherwise, which is an 8.6x on this workload and would make every number here meaningless. Four settings below are measurement discipline rather than experiment design, and changing any of them invalidates the timings: num_parallel_executions is 1 so the runs do not contend for the same GPU; early_stop_patience is 999 so all six complete the same 5 rounds, since a duration divided by a different number of rounds per run is not a comparison; fipa_warmup_rounds is 1 rather than the grid's 3, because the first rounds run as plain FedAvg and a warmup of 3 inside 5 rounds would leave only 2 rounds actually exercising FIPA; and every output path is namespaced away from the main grid so these short rows never land in the grid's results CSV or overwrite the checkpoints the inference-time work depends on.",
+  "ip_address": "127.0.0.1",
+  "port": 5301,
+  "base_csv_path": "csv_encryption_cost",
+  "base_log_path": "logs_encryption_cost",
+  "base_plot_path": "static/plots_encryption_cost",
+  "base_split_data_path": "run_dataset_encryption_cost",
+  "base_checkpoint_path": "checkpoints_encryption_cost",
+  "early_stop_patience": 999,
+  "weighted_aggregation": true,
+  "num_parallel_executions": 1,
+  "seed": 42,
+  "datasets": [
+    {
+      "name": "gtsrb",
+      "path": "dataset/gtsrb/train",
+      "num_classes": 43
+    }
+  ],
+  "common_search_space": {
+    "encryption_mode": [
+      "no_encryption",
+      "direct_encrypted_update"
+    ],
+    "device": [
+      "cuda"
+    ],
+    "global_epoch": [
+      5
+    ],
+    "local_epoch": [
+      1
+    ],
+    "num_clients": [
+      4
+    ],
+    "models_percentage": [
+      1
+    ],
+    "learning_rate": [
+      0.001
+    ],
+    "batch_size": [
+      16
+    ],
+    "aggregation_algorithm": [
+      "FedAvg",
+      "FedDisco",
+      "FIPA"
+    ],
+    "fedprox_mu": [
+      0.05
+    ],
+    "feddisco_a": [
+      0.5
+    ],
+    "feddisco_b": [
+      0.1
+    ],
+    "partition_strategy": [
+      "dirichlet"
+    ],
+    "dirichlet_alpha": [
+      0.5
+    ],
+    "partition_unit": [
+      "track"
+    ],
+    "fipa_warmup_rounds": [
+      1
+    ],
+    "fipa_rank": [
+      5
+    ],
+    "fipa_grad_batches": [
+      64
+    ],
+    "fipa_pinv_rtol": [
+      1e-8
+    ],
+    "train_augmentation": [
+      false
+    ]
+  },
+  "model_specific_search_space": {
+    "ResNet18": {
+      "image_size": [
+        128
+      ],
+      "num_custom_layers": [
+        2
+      ]
+    }
+  }
+}
