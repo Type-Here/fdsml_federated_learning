@@ -48,7 +48,8 @@ import fipa
 import fipa_encrypted
 from aggregation_policy import (FEDDISCO_DEFAULT_A, FEDDISCO_DEFAULT_B,
                                 NEEDS_GLOBAL_WEIGHTS, SUM_WEIGHTED_BY_SIZE,
-                                feddisco_weights, label_distribution_discrepancy)
+                                feddisco_integer_weights, feddisco_weights,
+                                label_distribution_discrepancy)
 from aggregation_policy import client_denominator as denominator_for_algorithm
 from aggregation_policy import effective_algorithm as effective_algorithm_for_round
 from aggregator import Aggregator
@@ -241,7 +242,7 @@ class ExtendedAggregator(Aggregator):
         self.last_aggregation_algorithm = algorithm
         total_training_size = sum(u.get('train_size', 0) for u in client_updates)
         self.last_result_denominator = denominator_for_algorithm(
-            algorithm, total_training_size)
+            algorithm, total_training_size, self.encryption_mode)
 
     def aggregate_evaluation_results(self, eval_updates: List[Dict],
                                      current_round: int) -> bool:
@@ -309,7 +310,8 @@ class ExtendedAggregator(Aggregator):
         sum.
         """
         algorithm = self.last_aggregation_algorithm or self.effective_algorithm(0)
-        return denominator_for_algorithm(algorithm, total_training_size)
+        return denominator_for_algorithm(algorithm, total_training_size,
+                                         self.encryption_mode)
 
     # ------------------------------------------------------------------
     # Plaintext aggregation: dispatch on the algorithm
@@ -503,14 +505,30 @@ class ExtendedAggregator(Aggregator):
         **The one thing to be careful about, and it is not the algebra.**
         Paillier is fixed point with a ceiling: `phe` stores a float as
         `int_rep * 16^exponent` and encrypts only the integer, which has to stay
-        under `n/3`; a multiplication *adds* exponents. Where FedAvg multiplied
-        by an integer `n_k` in the thousands, FedDisco multiplies by a float
-        `w_k` around 0.25, which consumes about fourteen orders of magnitude of
-        that budget in one go. That is affordable **once**, which is exactly what
-        happens here: one multiplication per ciphertext, then only additions, and
-        the client decrypts and re-encrypts every round so nothing accumulates
-        across rounds. Do not add a second float factor to this path without
-        reading `fipa_encrypted.py`'s module docstring first.
+        under `n/3`. A multiplication adds exponents, and an addition drags every
+        term down to the smallest exponent in the sum, multiplying its integer by
+        `16^difference`. FedAvg is safe from both because it multiplies by an
+        integer `n_k`, which `phe` encodes at exponent 0.
+
+        A float `w_k` around 0.25 is encoded at full 53-bit precision instead,
+        and measured on a real 128-bit keypair that is **not** affordable even
+        once: combined with the ordinary spread of a trained layer's weights it
+        decrypts wrongly as soon as two clients' values for the same coordinate
+        differ by five base-16 digits - one at 0.05, another at 1e-8. It usually
+        does not raise, because only the middle third of `[0, n)` produces an
+        `OverflowError`; the common outcome is a plausible wrong number.
+
+        So the weights are quantised onto an integer grid first
+        (`aggregation_policy.feddisco_integer_weights`) and the client divides
+        the grid scale back out through the `aggregation_denominator` it is
+        already sent. That restores exactly the property that makes FedAvg safe -
+        the exponent never moves - and correctness stops depending on the data.
+        The cost is that `w_k` is represented to ~3e-7 relative rather than
+        exactly, so this branch agrees with the plaintext one to about that,
+        not to 0.
+
+        Do not put a float factor back on this path without reading
+        `fipa_encrypted.py`'s module docstring first.
 
         Returns:
             True if the aggregation ran; False for a round in which no client
@@ -522,12 +540,13 @@ class ExtendedAggregator(Aggregator):
             return False
 
         w = self._feddisco_weights(client_updates)
+        scaled = feddisco_integer_weights(w)
 
         summed = multiply_encrypted_weights_by_scalar(
-            client_updates[0]['weights'], float(w[0]))
+            client_updates[0]['weights'], scaled[0])
         for k in range(1, len(client_updates)):
             weighted_update = multiply_encrypted_weights_by_scalar(
-                client_updates[k]['weights'], float(w[k]))
+                client_updates[k]['weights'], scaled[k])
             summed = sum_encrypted_weights(summed, weighted_update)
 
         self.current_weights = summed

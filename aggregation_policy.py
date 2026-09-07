@@ -58,6 +58,67 @@ KNOWN_ALGORITHMS = SUM_WEIGHTED_BY_SIZE + SERVER_RETURNS_FINAL_MODEL
 # "Divide by nothing", expressed as a number the client can always divide by.
 NO_RESCALING = 1.0
 
+# ----------------------------------------------------------------------------
+# FedDisco under Paillier: why its weights become integers
+# ----------------------------------------------------------------------------
+# Paillier encrypts integers, not floats. `phe` writes a float as
+# `int_rep * 16^exponent`, encrypts only `int_rep`, and requires it to stay
+# below `n/3` - about 2^125 with the 128-bit modulus the Trusted Authority
+# generates. Two operations spend that budget:
+#
+#   multiplication  adds the two exponents and multiplies the two integers;
+#   addition        cannot combine two different exponents, so it drags the
+#                   larger one DOWN to the smaller, multiplying its integer by
+#                   16^difference. In a sum the single smallest term therefore
+#                   dictates the representation of every other term.
+#
+# FedAvg never trips over this because it multiplies by `train_size`, an
+# integer, which `phe` encodes at exponent 0: the exponent does not move, and
+# only the natural spread of the weights themselves is paid for.
+#
+# A float multiplier is a different matter. `phe` encodes a float at full
+# 53-bit precision, so multiplying by `w_k ~ 0.25` costs about 2^54 of budget
+# on top of the spread - and measured on a real 128-bit keypair, the combination
+# fails once two clients' weights for the same coordinate differ by 5 base-16
+# digits (one at 0.05, another at 1e-8), which is entirely ordinary in a trained
+# layer. Worse, it usually does NOT raise: only the middle third of `[0, n)`
+# produces an `OverflowError`, so the common outcome is a plausible wrong number.
+#
+# The fix restores FedAvg's property instead of working around its absence:
+# quantise `w_k` onto a fixed integer grid, multiply by the integer, and let the
+# client divide the grid scale back out through the `aggregation_denominator`
+# that already travels in the round payload. The exponent stops moving, and
+# correctness stops depending on the data.
+FEDDISCO_ENCRYPTED_SCALE = 1 << 24
+
+
+def feddisco_integer_weights(weights: Sequence[float],
+                             scale: int = FEDDISCO_ENCRYPTED_SCALE) -> list:
+    """`w_k` on a fixed integer grid, still summing to exactly `scale`.
+
+    Args:
+        weights: the normalised FedDisco weights, summing to 1.
+        scale: the grid. The client divides the aggregated model by this.
+
+    Returns:
+        Integers summing to exactly `scale`. Rounding each weight
+        independently would leave the total a few units off, and that error
+        would land on the model as a systematic gain slightly different from 1;
+        the residual is given to the largest weight, where it is relatively
+        smallest.
+
+    At the default scale the weights are represented to ~3e-7 relative, which
+    is about float32's own resolution and far finer than the uncertainty in
+    `d_k` that produced them. Raising the scale buys precision nobody needs and
+    spends the headroom that keeps individual parameters from being silently
+    corrupted - see the note above.
+    """
+    quantised = [int(round(float(w) * scale)) for w in weights]
+    residual = scale - sum(quantised)
+    if quantised:
+        quantised[int(np.argmax(weights))] += residual
+    return quantised
+
 # Algorithms that do not run from round 0, but only after a warmup phase in
 # which plain FedAvg is used instead.
 #
@@ -131,7 +192,8 @@ def effective_algorithm(algorithm: str, round_number: int,
     return algorithm
 
 
-def client_denominator(algorithm: str, total_training_size: int) -> float:
+def client_denominator(algorithm: str, total_training_size: int,
+                       encryption_mode: str = "no_encryption") -> float:
     """What `_process_server_weights` must divide the server's payload by.
 
     The server used to send only `total_training_size` and the
@@ -143,10 +205,17 @@ def client_denominator(algorithm: str, total_training_size: int) -> float:
         algorithm: the value of `config['aggregation_algorithm']`.
         total_training_size: `N`, the sum of `train_size` over the clients that
             contributed to the round being sent out.
+        encryption_mode: the value of `config['encryption_mode']`. Only
+            FedDisco reads it, and only because its encrypted branch has to
+            weigh by integers rather than floats to stay inside Paillier's
+            fixed-point ceiling - see `FEDDISCO_ENCRYPTED_SCALE`. Defaulting to
+            plaintext keeps every existing caller answering exactly as before.
 
     Returns:
         The divisor. `float(N)` for the size-weighted family, `1.0` for the
-        algorithms whose server output is already the finished model.
+        algorithms whose server output is already the finished model - except
+        encrypted FedDisco, whose output is the finished model multiplied by
+        `FEDDISCO_ENCRYPTED_SCALE`.
 
     Raises:
         ValueError: for an algorithm nobody has classified yet. Failing loudly
@@ -161,6 +230,8 @@ def client_denominator(algorithm: str, total_training_size: int) -> float:
     """
     if algorithm in SUM_WEIGHTED_BY_SIZE:
         return float(total_training_size)
+    if algorithm == "FedDisco" and encryption_mode != "no_encryption":
+        return float(FEDDISCO_ENCRYPTED_SCALE)
     if algorithm in SERVER_RETURNS_FINAL_MODEL:
         return NO_RESCALING
     raise ValueError(
