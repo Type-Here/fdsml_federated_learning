@@ -252,10 +252,15 @@ class ExtendedModelManager(ModelManager):
            statistics the exported global model carries, on data seen in a
            different order than during training.
 
-        2. **No `optimizer.step()`, and gradients cleared afterwards.** This
-           pass must observe the model the client is about to send, not move it.
-           A single stray step would make the reported `theta_m` inconsistent
-           with the curvature reported alongside it.
+        2. **No `optimizer.step()`, and gradients cleared afterwards.** This is
+           called at theta^(k), the global model just received for this round,
+           before local training moves it to theta_m - because the server
+           applies the preconditioner to `Delta_m = theta_m - theta^(k)`
+           starting from theta^(k), so the curvature has to be measured at that
+           same point, not at the model the client ends up sending. A single
+           stray step, or a leftover gradient, would make the curvature
+           inconsistent with the point it is supposed to describe, and would
+           also corrupt the local training that follows this call.
 
         3. **The plain task loss**, `self.criterion` - not the FedProx proximal
            term nor the FedLC calibration. The Fisher information is about how

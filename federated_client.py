@@ -283,8 +283,18 @@ class FederatedClient:
         return data.get('aggregation_algorithm',
                         self.config.get("aggregation_algorithm", "FedAvg"))
 
-    def _build_fipa_update(self, global_weights, local_weights, data: Dict) -> Dict:
+    def _build_fipa_update(self, global_weights, local_weights, data: Dict,
+                            fipa_factors) -> Dict:
         """The payload of a FIPA round: the movement and the curvature.
+
+        `fipa_factors` is `(directions, curvature, explained)`, collected by
+        the caller at `global_weights` - i.e. at theta^(k), the model this
+        client received at the start of the round - and simply packaged here.
+        It is not recomputed at this point because the server applies the
+        preconditioner to `Delta_m = theta_m - theta^(k)` starting from
+        theta^(k): the update is linearized around the point the client
+        received, not the point local training ends at, so that is where the
+        curvature must be measured.
 
         Common to both routes:
 
@@ -330,13 +340,7 @@ class FederatedClient:
         local_flat, shapes = fipa.flatten_weights(local_weights)
         delta_flat = local_flat - global_flat
 
-        directions, curvature, explained = self.local_model.collect_gradient_factors(
-            batch_size=data['batch_size'],
-            rank=int(self.config.get('fipa_rank', 5)),
-            max_batches=self.config.get('fipa_grad_batches'),
-            random_state=int(self.config.get('seed', 42)),
-            logger=self.logger,
-        )
+        directions, curvature, explained = fipa_factors
         payload = {
             'fipa_U': object_to_pickle_string(directions),
             'fipa_lambda': object_to_pickle_string(curvature),
@@ -369,6 +373,27 @@ class FederatedClient:
             self.local_model.set_weights(averaged_weights)
 
             algorithm = self._round_algorithm(data)
+
+            # FIPA's curvature factors (U_m, L_m) must be measured at theta^(k),
+            # the global model just set above - not at theta_m, where local
+            # training ends - because the server later applies the
+            # preconditioner to Delta_m = theta_m - theta^(k) starting from
+            # theta^(k). So they are collected here, before `train()` moves the
+            # model, and carried into `_build_fipa_update` further down rather
+            # than being recomputed there.
+            fipa_factors = None
+            if algorithm == 'FIPA':
+                self.logger.info("Round %s is a FIPA refinement round: collecting "
+                                 "curvature factors at the received global weights.",
+                                 data['round_number'])
+                fipa_factors = self.local_model.collect_gradient_factors(
+                    batch_size=data['batch_size'],
+                    rank=int(self.config.get('fipa_rank', 5)),
+                    max_batches=self.config.get('fipa_grad_batches'),
+                    random_state=int(self.config.get('seed', 42)),
+                    logger=self.logger,
+                )
+
             _, train_map, train_loss, train_size = self.local_model.train(
                 epochs=data['epochs'], lr=data['learning_rate'], batch_size=data['batch_size'],
                 algorithm=algorithm,
@@ -394,9 +419,8 @@ class FederatedClient:
             # and then throw them away. A warmup round takes the other branch
             # and is byte for byte what it was before this feature existed.
             if algorithm == 'FIPA':
-                self.logger.info("Round %s is a FIPA refinement round: collecting "
-                                 "curvature factors.", data['round_number'])
-                response.update(self._build_fipa_update(averaged_weights, local_weights, data))
+                response.update(self._build_fipa_update(averaged_weights, local_weights, data,
+                                                         fipa_factors))
             else:
                 if self.encryption_mode != 'no_encryption':
                     weights_to_send = encrypt_weights(self.paillier_pubkey, local_weights,
