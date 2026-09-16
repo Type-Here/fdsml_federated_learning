@@ -1,66 +1,38 @@
-# Checkpoint runs - four models for the inference-time work
+# Checkpoint runs — the four models the inference-time work starts from
 
-Four federated runs on GTSRB whose product is not a number but a **file**: the
-trained global model, which everything on the inference side starts from. Until
-now a finished run left only its metrics; the model lived in memory and the
-process exited.
+**Why it exists.** The product of these runs is not a number but a **file**: the
+trained global model, which the test-time adaptation half consumes. Unlike the two
+smoke tests these are **real runs** — full dataset, 30 rounds, results that count.
 
-Unlike the two smoke tests, **these are real runs** - full dataset, 30 rounds,
-results that count. `grid_search_config_checkpoints.json` is a strict subset of
-`grid_search_config.json`: same paths, same fixed parameters, every axis narrowed
-to a value that file already contains. So the four rows land in the **same**
-shared results CSV, and when the full grid is launched later it recognizes them
-by fingerprint and runs **41 instead of 45**. Nothing here is repeated work.
+`grid_search_config_checkpoints.json` is a strict subset of
+`grid_search_config.json` — same paths, same fixed parameters, every axis narrowed
+to a value that file already contains — so the four rows land in the same shared
+results CSV and the full grid later recognises them by fingerprint and skips them.
+Nothing here is repeated work.
 
 | | |
 |---|---|
-| model | ResNet18, `num_custom_layers: 2` (frozen backbone, trainable head of 142 379 parameters) |
+| model | ResNet18, `num_custom_layers: 2` (frozen backbone, head of 142 379 parameters) |
 | algorithms | FedAvg, FIPA |
 | `dirichlet_alpha` | 0.1, 0.5 |
 | clients | 4, all sampled every round |
 | rounds | `global_epoch: 30`, `local_epoch: 1` |
 | encryption | `no_encryption` |
-| **runs** | **2 x 2 = 4** |
+| **runs** | **2 x 2 = 4**, ~2.8 h at the measured ~85 s/round |
 
-## Why these four and not others
+**Why these four.** ResNet18 only, because the adaptation stage adjusts BatchNorm
+and `ConvNet` (HE-friendly, `x*x` activations) has none at all — a checkpoint from
+it is not less useful, it is unusable. No encryption axis, because in encrypted mode
+the server holds Paillier ciphertexts and has no private key, so a plaintext
+checkpoint cannot come from such a run. No FedProx, because server-side it performs
+the same arithmetic as FedAvg; the same GPU hours buy more on the alpha axis.
 
-**ResNet18 only.** The adaptation stage adjusts BatchNorm, and `ConvNet`
-(`model_manager.py:15`) is the HE-friendly network with `x*x` activations - it
-has no BatchNorm layer at all, and neither does torchvision's AlexNet. A
-checkpoint from those is not less useful, it is unusable. ConvNet keeps its place
-in the full grid, where it is the only non-transfer-learning entry.
-
-**No encryption axis.** Two independent reasons: in encrypted mode
-`current_weights` holds Paillier ciphertext dictionaries and the server has no
-private key - by design, the Trusted Authority hands keys to clients only - so a
-plaintext checkpoint cannot come from such a run; and the two modes were measured
-to differ by less than two runs of the *same* mode do.
-
-**No FedProx.** Server-side it performs the same arithmetic as FedAvg - a
-summation weighted by `train_size`, the shared branch at `aggregator.py:59`. It
-differs in local training, so the model is not identical, but it does not ask a
-new question of the adaptation stage. The same GPU hours buy more on the alpha
-axis, which changes the starting model much more.
-
-**`local_epoch: 1`.** Cost is `global_epoch x local_epoch` passes over the
-training set, so 5 would be five times the wall clock. The client-drift axis
-belongs to the full grid, where it is the knob FIPA claims to correct; here the
-model is the deliverable, not the comparison.
-
-## Cost
-
-`30 x 1 = 30` passes per run, **120 passes** in total - 3.4% of the full grid's
-3510. The per-pass constant on a Colab GPU has **never been measured**, and every
-hour estimate for the full grid scales off it, so take that measurement here:
-time the first round and multiply. The rough expectation is 20-40 s per pass,
-i.e. 40-80 minutes for all four.
-
-## Running it on Colab
+## Cells
 
 ```python
 # 1. Clone the working branch EXPLICITLY. On main, main() takes no argument and
 #    the config on the command line is ignored - the inherited grid runs instead.
-!git clone -b features/tta <repo-url> fdsml
+!git clone -b features/feddisco <repo-url> fdsml
 %cd fdsml
 
 # 2. Install only what Colab is missing. Do NOT install requirements_gpu.txt
@@ -70,19 +42,16 @@ i.e. 40-80 minutes for all four.
 # 3. Build the dataset (downloads ~200 MB, writes dataset/gtsrb/train/00000..00042)
 !python datasets_prep/prepare_gtsrb.py --splits train
 
-# 4. Run the four configurations, in sequence (num_parallel_executions: 1)
+# 4. The four configurations, in sequence (num_parallel_executions: 1)
 !python federated_grid_search.py grid_search_config_checkpoints.json
 
-# 5. Look at what came out, without unpickling anything
+# 5. Inspect what came out, without unpickling anything
 !ls -lh checkpoints_*/
 !cat checkpoints_*/*.json | head -60
 ```
 
-Use `%cd`, not `!cd`: `!cd` opens a subshell that dies with the cell. Step 3
-takes a few minutes and has to be redone if the runtime disconnects.
-
-**Download the checkpoints before the session ends.** They are the only output
-that cannot be recomputed cheaply:
+**Download the checkpoints before the session ends** — they are the only output that
+cannot be recomputed cheaply:
 
 ```python
 from google.colab import files
@@ -90,60 +59,36 @@ from google.colab import files
 files.download('checkpoints.zip')
 ```
 
+**Watch round 2 of the first run.** If f1 is in the 0.3–0.5 range it is working; if
+it is around 0.03, kill it rather than paying 2.8 hours.
+
 ## What "passed" looks like
 
-**1. The process exits on its own**, printing
-`=== All parallel executions have finished. ===`.
+1. **The process exits on its own**, printing
+   `=== All parallel executions have finished. ===`.
+2. **Four checkpoints in `checkpoints_<hostname>/`**, each a `.pkl` with a `.json`
+   twin: `gtsrb_ResNet18_{FedAvg,FIPA}_a{0.1,0.5}_c4_le1_seed42_<timestamp>.pkl`.
+3. **The server log confirms the rescale**, one line per run:
+   `Saved global model checkpoint to ... (round 24, f1 0.8xxx, 142379 parameters, descaled by 20xxx.xxxx)`
 
-**2. Four checkpoints on disk**, in `checkpoints_<hostname>/`, each with a `.pkl`
-and a `.json` twin. The filenames say what they are:
+   | algorithm | expected divisor | why |
+   |---|---|---|
+   | FedAvg | the round's total training size, **~20 000** | the server aggregates by summation and the clients divide; the checkpoint must do the same |
+   | FIPA | **1.0** | FIPA does not produce an average — its result already is the model |
 
-```
-gtsrb_ResNet18_FedAvg_a0.1_c4_le1_seed42_<timestamp>.pkl
-gtsrb_ResNet18_FedAvg_a0.5_c4_le1_seed42_<timestamp>.pkl
-gtsrb_ResNet18_FIPA_a0.1_c4_le1_seed42_<timestamp>.pkl
-gtsrb_ResNet18_FIPA_a0.5_c4_le1_seed42_<timestamp>.pkl
-```
-
-**3. The server log confirms the rescale**, one line per run:
-
-```
-Saved global model checkpoint to ... (round 24, f1 0.8xxx, 142379 parameters, descaled by 20xxx.xxxx)
-```
-
-Read `descaled by` carefully, because it is the one number that decides whether
-the file is usable:
-
-| algorithm | expected divisor | what it means |
-|---|---|---|
-| FedAvg | the round's total training size, **~20000** | the server aggregates by summation and the clients divide; the checkpoint has to do the same division |
-| FIPA | **1.0** | FIPA does not produce an average - its result already is the model |
-
-A FedAvg checkpoint reporting `descaled by 1.0` would be wrong by a factor of
-twenty thousand, and would load without complaint and predict noise. FIPA's
-`1.0` is correct and is not a missing divisor.
-
-Note that FIPA's divisor is `1.0` only if its best round was a FIPA round. With
-`fipa_warmup_rounds: 3`, if round 0, 1 or 2 turned out to be the best, the
-divisor is `N` - the checkpoint follows the round the weights came from, not the
-one the run ended on. Check `best_round` in the JSON before deciding anything is
-wrong.
-
-**4. `num_parameters: 142379`** in every JSON. That is
-`512x256 + 256` for the first layer plus `256x43 + 43` for the second, i.e. the
-custom head and nothing else - so the backbone, and with it every BatchNorm
-layer, was frozen as intended. A different number means `num_custom_layers`
-was not 2, and that model cannot serve as the source for the adaptation work.
-
-**5. `"bn_stats_source": "imagenet"`** in every JSON. Not a defect: BatchNorm's
-`running_mean` / `running_var` are buffers rather than parameters, so
-`get_weights` never saw them and no round ever aggregated them. Whoever loads the
-checkpoint gets a freshly built backbone's statistics, which are ImageNet's. The
-field is there so that this is a known property rather than a discovery, and it
-is what the recalibration pass exists to fix.
-
-**6. The results CSV has a `checkpoint_path` column**, so each row can be traced
-to the model it produced.
+   A FedAvg checkpoint reporting `descaled by 1.0` is wrong by a factor of twenty
+   thousand, loads without complaint and predicts noise. FIPA's `1.0` is correct.
+   But FIPA's divisor is `1.0` only if its best round was a FIPA round — with
+   `fipa_warmup_rounds: 3`, a best model from round 0–2 carries divisor `N`. Check
+   `best_round` in the JSON before deciding anything is wrong.
+4. **`num_parameters: 142379`** in every JSON — `512x256 + 256` plus `256x43 + 43`,
+   i.e. the custom head and nothing else, so the backbone and every BatchNorm layer
+   was frozen as intended.
+5. **`"bn_stats_source": "imagenet"`** in every JSON. Not a defect: BatchNorm's
+   `running_mean` / `running_var` are buffers, not parameters, so no round ever
+   aggregated them and a loaded checkpoint gets a fresh backbone's statistics. The
+   field makes that a known property; the recalibration pass is what fixes it.
+6. **The results CSV has a `checkpoint_path` column**, so each row traces to its model.
 
 ## Loading one afterwards
 
@@ -167,8 +112,7 @@ manager.set_weights(checkpoint['weights'])
 manager.validate(batch_size=64, split='fog_s3')
 ```
 
-`set_weights` copies **positionally** into whatever
-`_get_trainable_parameters()` returns, which is why the architecture travels in
-the metadata: built with a different `num_custom_layers` or `num_classes`, the
-same arrays either raise on a shape mismatch or, worse, fit and mean something
-else.
+`set_weights` copies **positionally** into whatever `_get_trainable_parameters()`
+returns, which is why the architecture travels in the metadata: built with a
+different `num_custom_layers` or `num_classes`, the same arrays either raise on a
+shape mismatch or, worse, fit and mean something else.

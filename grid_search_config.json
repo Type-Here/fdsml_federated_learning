@@ -47,10 +47,17 @@
     "aggregation_algorithm": [
       "FedAvg",
       "FedProx",
+      "FedDisco",
       "FIPA"
     ],
     "fedprox_mu": [
       0.05
+    ],
+    "feddisco_a": [
+      0.5
+    ],
+    "feddisco_b": [
+      0.1
     ],
     "partition_strategy": [
       "dirichlet"

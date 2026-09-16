@@ -395,8 +395,10 @@ def test_an_update_predating_payload_kind_is_read_as_weights():
 
 
 def test_unknown_algorithm_raises_on_the_plaintext_path():
+    # An algorithm nobody has implemented. It used to be FedDisco, which is now
+    # a real branch - the point of the test is the refusal, not the name.
     aggregator = make_aggregator(aggregation_algorithm="FedAvg")
-    with pytest.raises(ValueError, match="FedDisco"):
+    with pytest.raises(ValueError, match="FedNova"):
         aggregator.aggregate_weights(
-            [weights_update("client_0", _weights(1), 10)], "FedDisco"
+            [weights_update("client_0", _weights(1), 10)], "FedNova"
         )
